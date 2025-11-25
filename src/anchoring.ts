@@ -186,7 +186,8 @@ async function getOptimizedBitcoinFee(
  * Get optimized gas settings for Ethereum
  */
 async function getOptimizedEthereumGas(
-  provider: any
+  provider: any,
+  walletAddress?: string
 ): Promise<{ gasLimit: number; maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint }> {
   try {
     // Get current fee data
@@ -195,9 +196,11 @@ async function getOptimizedEthereumGas(
     // Estimate gas limit for data transaction
     let gasLimit = 21000; // Minimum for simple transaction
     try {
+      // Use wallet address if provided, otherwise use a dummy address for estimation
+      const toAddress = walletAddress || '0x0000000000000000000000000000000000000000';
       // Create a test transaction to estimate gas
       const testTx = {
-        to: await provider.getSigner().address,
+        to: toAddress,
         data: '0x' + '00'.repeat(32), // 32 bytes of data (similar to our hash)
         value: 0
       };
@@ -793,8 +796,8 @@ export async function anchorToEthereum(
     const dataString = JSON.stringify(dataPayload);
     const dataHash = ethers.keccak256(ethers.toUtf8Bytes(dataString));
     
-    // Get optimized gas settings
-    const gasSettings = await getOptimizedEthereumGas(provider);
+    // Get optimized gas settings (pass wallet address for accurate estimation)
+    const gasSettings = await getOptimizedEthereumGas(provider, wallet.address);
     
     // Create transaction
     const tx = {
