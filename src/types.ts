@@ -7,6 +7,33 @@ export interface AttestationRequest {
   signature: string;
   did: string;
   timestamp: string;
+  /** Process digest (optional, from Process Layer) */
+  processDigest?: string;
+  /** Compound hash (content + process, optional) */
+  compoundHash?: string;
+  /** Process metrics (optional, for verification) */
+  processMetrics?: {
+    duration: number;
+    entropy: number;
+    temporalCoherence: number;
+    inputEvents: number;
+    meetsThresholds: boolean;
+  };
+  /** ZK-SNARK proof (optional, for privacy-preserving verification) */
+  zkProof?: {
+    proof: {
+      pi_a: [string, string];
+      pi_b: [[string, string], [string, string]];
+      pi_c: [string, string];
+    };
+    publicSignals: string[];
+  };
+  /** Assistance profile (human-only, AI-assisted, AI-generated) - for tier determination */
+  assistanceProfile?: 'human-only' | 'AI-assisted' | 'AI-generated';
+  /** Device identifier where work was authored */
+  authoredOnDevice?: string;
+  /** Environment attestation (browser, OS, etc.) */
+  environmentAttestation?: string | string[];
 }
 
 export interface AttestationReceipt {
@@ -29,6 +56,20 @@ export interface ProofRecord {
   anchored?: boolean;
   anchor_tx?: string;
   anchor_chain?: string;
+  /** Process digest (from Process Layer) */
+  process_digest?: string;
+  /** Compound hash (content + process) */
+  compound_hash?: string;
+  /** Process metrics summary */
+  process_metrics?: string; // JSON string
+  /** ZK-SNARK proof (JSON string) */
+  zk_proof?: string; // JSON string
+  /** Proof tier (green, blue, purple, grey) - determined from credentials */
+  tier?: string;
+  /** Device identifier where work was authored */
+  authored_on_device?: string;
+  /** Environment attestation (JSON string) */
+  environment_attestation?: string; // JSON string
 }
 
 export interface MerkleBatch {

@@ -6,16 +6,36 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { ProofRecord, MerkleBatch } from './types';
+import { DIDDocument, KCGNode } from './did';
+import { AttestorRecord, VerifiableHumanCredential, RevocationRecord, AuditLogEntry } from './attestors';
 
 export class SimpleDatabase {
   private dataDir: string;
   private proofsFile: string;
   private batchesFile: string;
+  private didsFile: string;
+  private kcgFile: string;
+  private attestorsFile: string;
+  private credentialsFile: string;
+  private revocationsFile: string;
+  private auditLogsFile: string;
+  private reputationFile: string;
+  private submissionHistoryFile: string;
+  private anomalyLogFile: string;
 
   constructor(dataDir: string = './data') {
     this.dataDir = dataDir;
     this.proofsFile = join(dataDir, 'proofs.json');
     this.batchesFile = join(dataDir, 'batches.json');
+    this.didsFile = join(dataDir, 'dids.json');
+    this.kcgFile = join(dataDir, 'kcg.json');
+    this.attestorsFile = join(dataDir, 'attestors.json');
+    this.credentialsFile = join(dataDir, 'credentials.json');
+    this.revocationsFile = join(dataDir, 'revocations.json');
+    this.auditLogsFile = join(dataDir, 'audit-logs.json');
+    this.reputationFile = join(dataDir, 'reputation.json');
+    this.submissionHistoryFile = join(dataDir, 'submission-history.json');
+    this.anomalyLogFile = join(dataDir, 'anomaly-log.json');
 
     // Ensure data directory exists
     if (!existsSync(dataDir)) {
@@ -28,6 +48,33 @@ export class SimpleDatabase {
     }
     if (!existsSync(this.batchesFile)) {
       writeFileSync(this.batchesFile, JSON.stringify([], null, 2));
+    }
+    if (!existsSync(this.didsFile)) {
+      writeFileSync(this.didsFile, JSON.stringify({}, null, 2));
+    }
+    if (!existsSync(this.kcgFile)) {
+      writeFileSync(this.kcgFile, JSON.stringify({}, null, 2));
+    }
+    if (!existsSync(this.attestorsFile)) {
+      writeFileSync(this.attestorsFile, JSON.stringify({}, null, 2));
+    }
+    if (!existsSync(this.credentialsFile)) {
+      writeFileSync(this.credentialsFile, JSON.stringify({}, null, 2));
+    }
+    if (!existsSync(this.revocationsFile)) {
+      writeFileSync(this.revocationsFile, JSON.stringify({}, null, 2));
+    }
+    if (!existsSync(this.auditLogsFile)) {
+      writeFileSync(this.auditLogsFile, JSON.stringify([], null, 2));
+    }
+    if (!existsSync(this.reputationFile)) {
+      writeFileSync(this.reputationFile, JSON.stringify({}, null, 2));
+    }
+    if (!existsSync(this.submissionHistoryFile)) {
+      writeFileSync(this.submissionHistoryFile, JSON.stringify({}, null, 2));
+    }
+    if (!existsSync(this.anomalyLogFile)) {
+      writeFileSync(this.anomalyLogFile, JSON.stringify({}, null, 2));
     }
   }
 
@@ -67,6 +114,16 @@ export class SimpleDatabase {
   getProofByHash(hash: string): ProofRecord | null {
     const proofs = this.readProofs();
     return proofs.find(p => p.hash === hash) || null;
+  }
+
+  getProofByCompoundHash(compoundHash: string): ProofRecord | null {
+    const proofs = this.readProofs();
+    return proofs.find(p => p.compound_hash === compoundHash) || null;
+  }
+
+  getAllProofsByHash(hash: string): ProofRecord[] {
+    const proofs = this.readProofs();
+    return proofs.filter(p => p.hash === hash);
   }
 
   getPendingProofs(limit: number = 1000): ProofRecord[] {
@@ -137,8 +194,288 @@ export class SimpleDatabase {
     return this.readProofs().filter(p => !p.batch_id).length;
   }
 
+  // DID Document storage
+  private readDIDs(): Record<string, DIDDocument> {
+    const data = readFileSync(this.didsFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeDIDs(dids: Record<string, DIDDocument>) {
+    writeFileSync(this.didsFile, JSON.stringify(dids, null, 2));
+  }
+
+  storeDIDDocument(did: string, document: DIDDocument): void {
+    const dids = this.readDIDs();
+    dids[did] = document;
+    this.writeDIDs(dids);
+  }
+
+  getDIDDocument(did: string): DIDDocument | null {
+    const dids = this.readDIDs();
+    return dids[did] || null;
+  }
+
+  getAllDIDDocuments(): DIDDocument[] {
+    const dids = this.readDIDs();
+    return Object.values(dids);
+  }
+
+  // Key Continuity Graph storage
+  private readKCG(): Record<string, KCGNode> {
+    const data = readFileSync(this.kcgFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeKCG(kcg: Record<string, KCGNode>) {
+    writeFileSync(this.kcgFile, JSON.stringify(kcg, null, 2));
+  }
+
+  storeKCGNode(did: string, node: KCGNode): void {
+    const kcg = this.readKCG();
+    kcg[did] = node;
+    this.writeKCG(kcg);
+  }
+
+  getKCGNode(did: string): KCGNode | null {
+    const kcg = this.readKCG();
+    return kcg[did] || null;
+  }
+
+  getContinuityChain(did: string): KCGNode[] {
+    const chain: KCGNode[] = [];
+    const kcg = this.readKCG();
+    let currentDID: string | undefined = did;
+
+    while (currentDID) {
+      const node: KCGNode | undefined = kcg[currentDID];
+      if (!node) break;
+      chain.unshift(node);
+      currentDID = node.previousNode;
+    }
+
+    return chain;
+  }
+
+  // Attestor storage
+  private readAttestors(): Record<string, AttestorRecord> {
+    const data = readFileSync(this.attestorsFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeAttestors(attestors: Record<string, AttestorRecord>) {
+    writeFileSync(this.attestorsFile, JSON.stringify(attestors, null, 2));
+  }
+
+  storeAttestor(did: string, record: AttestorRecord): void {
+    const attestors = this.readAttestors();
+    attestors[did] = record;
+    this.writeAttestors(attestors);
+  }
+
+  getAttestor(did: string): AttestorRecord | null {
+    const attestors = this.readAttestors();
+    return attestors[did] || null;
+  }
+
+  getAllAttestors(): AttestorRecord[] {
+    const attestors = this.readAttestors();
+    return Object.values(attestors);
+  }
+
+  // Credential storage
+  private readCredentials(): Record<string, VerifiableHumanCredential> {
+    const data = readFileSync(this.credentialsFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeCredentials(credentials: Record<string, VerifiableHumanCredential>) {
+    writeFileSync(this.credentialsFile, JSON.stringify(credentials, null, 2));
+  }
+
+  storeCredential(hash: string, credential: VerifiableHumanCredential): void {
+    const credentials = this.readCredentials();
+    credentials[hash] = credential;
+    this.writeCredentials(credentials);
+  }
+
+  getCredential(hash: string): VerifiableHumanCredential | null {
+    const credentials = this.readCredentials();
+    return credentials[hash] || null;
+  }
+
+  getAllCredentials(): VerifiableHumanCredential[] {
+    const credentials = this.readCredentials();
+    return Object.values(credentials);
+  }
+
+  // Revocation storage
+  private readRevocations(): Record<string, RevocationRecord> {
+    const data = readFileSync(this.revocationsFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeRevocations(revocations: Record<string, RevocationRecord>) {
+    writeFileSync(this.revocationsFile, JSON.stringify(revocations, null, 2));
+  }
+
+  storeRevocation(hash: string, revocation: RevocationRecord): void {
+    const revocations = this.readRevocations();
+    revocations[hash] = revocation;
+    this.writeRevocations(revocations);
+  }
+
+  getRevocation(hash: string): RevocationRecord | null {
+    const revocations = this.readRevocations();
+    return revocations[hash] || null;
+  }
+
+  getAllRevocations(): RevocationRecord[] {
+    const revocations = this.readRevocations();
+    return Object.values(revocations);
+  }
+
+  // Audit log storage
+  private readAuditLogs(): AuditLogEntry[] {
+    const data = readFileSync(this.auditLogsFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeAuditLogs(logs: AuditLogEntry[]) {
+    writeFileSync(this.auditLogsFile, JSON.stringify(logs, null, 2));
+  }
+
+  appendAuditLog(entry: AuditLogEntry): void {
+    const logs = this.readAuditLogs();
+    logs.push(entry);
+    // Keep only last 10000 entries
+    if (logs.length > 10000) {
+      logs.splice(0, logs.length - 10000);
+    }
+    this.writeAuditLogs(logs);
+  }
+
+  getAuditLogs(attestorDID?: string, limit: number = 100): AuditLogEntry[] {
+    let logs = this.readAuditLogs();
+    
+    if (attestorDID) {
+      logs = logs.filter(log => log.attestorDID === attestorDID);
+    }
+
+    return logs
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, limit);
+  }
+
+  // Fraud mitigation storage
+  private readReputation(): { [did: string]: any } {
+    if (!this.reputationFile) {
+      this.reputationFile = join(this.dataDir, 'reputation.json');
+      if (!existsSync(this.reputationFile)) {
+        writeFileSync(this.reputationFile, JSON.stringify({}, null, 2));
+      }
+    }
+    const data = readFileSync(this.reputationFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeReputation(reputation: { [did: string]: any }) {
+    if (!this.reputationFile) {
+      this.reputationFile = join(this.dataDir, 'reputation.json');
+    }
+    writeFileSync(this.reputationFile, JSON.stringify(reputation, null, 2));
+  }
+
+  storeReputation(did: string, reputation: any): void {
+    const all = this.readReputation();
+    all[did] = reputation;
+    this.writeReputation(all);
+  }
+
+  getReputation(did: string): any | null {
+    const all = this.readReputation();
+    return all[did] || null;
+  }
+
+  getAllReputation(): { [did: string]: any } {
+    return this.readReputation();
+  }
+
+  private readSubmissionHistory(): { [did: string]: any[] } {
+    if (!this.submissionHistoryFile) {
+      this.submissionHistoryFile = join(this.dataDir, 'submission-history.json');
+      if (!existsSync(this.submissionHistoryFile)) {
+        writeFileSync(this.submissionHistoryFile, JSON.stringify({}, null, 2));
+      }
+    }
+    const data = readFileSync(this.submissionHistoryFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeSubmissionHistory(history: { [did: string]: any[] }) {
+    if (!this.submissionHistoryFile) {
+      this.submissionHistoryFile = join(this.dataDir, 'submission-history.json');
+    }
+    writeFileSync(this.submissionHistoryFile, JSON.stringify(history, null, 2));
+  }
+
+  appendSubmissionHistory(did: string, record: any): void {
+    const all = this.readSubmissionHistory();
+    if (!all[did]) {
+      all[did] = [];
+    }
+    all[did].push(record);
+    
+    // Keep only last 24 hours
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    all[did] = all[did].filter((r: any) => r.timestamp >= oneDayAgo);
+    
+    this.writeSubmissionHistory(all);
+  }
+
+  getSubmissionHistory(did: string): any[] {
+    const all = this.readSubmissionHistory();
+    return all[did] || [];
+  }
+
+  private readAnomalyLog(): { [did: string]: string[] } {
+    if (!this.anomalyLogFile) {
+      this.anomalyLogFile = join(this.dataDir, 'anomaly-log.json');
+      if (!existsSync(this.anomalyLogFile)) {
+        writeFileSync(this.anomalyLogFile, JSON.stringify({}, null, 2));
+      }
+    }
+    const data = readFileSync(this.anomalyLogFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeAnomalyLog(log: { [did: string]: string[] }) {
+    if (!this.anomalyLogFile) {
+      this.anomalyLogFile = join(this.dataDir, 'anomaly-log.json');
+    }
+    writeFileSync(this.anomalyLogFile, JSON.stringify(log, null, 2));
+  }
+
+  appendAnomalyLog(did: string, entry: string): void {
+    const all = this.readAnomalyLog();
+    if (!all[did]) {
+      all[did] = [];
+    }
+    all[did].push(entry);
+    
+    // Keep only last 100 entries per DID
+    if (all[did].length > 100) {
+      all[did] = all[did].slice(-100);
+    }
+    
+    this.writeAnomalyLog(all);
+  }
+
+  getAnomalyLog(did: string): string[] {
+    const all = this.readAnomalyLog();
+    return all[did] || [];
+  }
+
   close() {
     // No-op for file-based storage
   }
 }
-
