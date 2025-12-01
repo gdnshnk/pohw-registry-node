@@ -5,8 +5,8 @@
 
 // Import crypto for hashing
 import { createHash } from 'crypto';
-import { BitcoinRPC } from './bitcoin-rpc';
-import { BitcoinExplorerAPI } from './bitcoin-explorer-api';
+import { BitcoinRPC, BitcoinUTXO } from './bitcoin-rpc';
+import { BitcoinExplorerAPI, ExplorerUTXO } from './bitcoin-explorer-api';
 
 // Optional imports - will be available if packages are installed
 let bitcoin: any;
@@ -269,7 +269,7 @@ async function anchorToBitcoinWithRPC(
 
   try {
     // 1. Get UTXOs for the address (with retry)
-    const utxos = await retryWithBackoff(
+    const utxos = await retryWithBackoff<BitcoinUTXO[]>(
       () => rpc.getUTXOs(address),
       3,
       1000,
@@ -375,7 +375,7 @@ async function anchorToBitcoinWithRPC(
     const txHex = tx.toHex();
 
     // 8. Broadcast transaction (with retry)
-    const txHash = await retryWithBackoff(
+    const txHash = await retryWithBackoff<string>(
       () => rpc.sendRawTransaction(txHex),
       3,
       2000,
@@ -388,9 +388,9 @@ async function anchorToBitcoinWithRPC(
       // Wait a moment for transaction to be included
       await new Promise(resolve => setTimeout(resolve, 2000));
       
-      const txInfo = await rpc.getTransaction(txHash);
-      if (txInfo.confirmations > 0) {
-        const blockCount = await rpc.getBlockCount();
+      const txInfo = await rpc.getTransaction(txHash) as any;
+      if (txInfo && txInfo.confirmations > 0) {
+        const blockCount = await rpc.getBlockCount() as number;
         blockNumber = blockCount - txInfo.confirmations + 1;
       }
     } catch (e) {
@@ -430,7 +430,7 @@ async function anchorToBitcoinWithExplorer(
 
   try {
     // 1. Get UTXOs (with retry)
-    const utxos = await retryWithBackoff(
+    const utxos = await retryWithBackoff<ExplorerUTXO[]>(
       () => explorer.getUTXOs(address),
       3,
       1000,
@@ -493,7 +493,7 @@ async function anchorToBitcoinWithExplorer(
         });
       } else {
         // For P2PKH, use nonWitnessUtxo (with retry)
-        const txHex = await retryWithBackoff(
+        const txHex = await retryWithBackoff<string>(
           () => explorer.getTransactionHex(utxo.txid),
           3,
           1000,
@@ -502,7 +502,7 @@ async function anchorToBitcoinWithExplorer(
         psbt.addInput({
           hash: utxo.txid,
           index: utxo.vout,
-          nonWitnessUtxo: Buffer.from(txHex, 'hex')
+          nonWitnessUtxo: Buffer.from(txHex as string, 'hex')
         });
       }
     }
@@ -544,7 +544,7 @@ async function anchorToBitcoinWithExplorer(
     const txHex = tx.toHex();
 
     // 7. Broadcast via explorer API (with retry)
-    const txHash = await retryWithBackoff(
+    const txHash = await retryWithBackoff<string>(
       () => explorer.broadcastTransaction(txHex),
       3,
       2000,
@@ -555,9 +555,9 @@ async function anchorToBitcoinWithExplorer(
     let blockNumber: number | undefined;
     try {
       await new Promise(resolve => setTimeout(resolve, 3000));
-      const status = await explorer.getTransactionStatus(txHash);
-      if (status.confirmed && status.blockHeight) {
-        blockNumber = status.blockHeight;
+      const status = await explorer.getTransactionStatus(txHash) as any;
+      if (status && status.confirmed && status.blockHeight) {
+        blockNumber = status.blockHeight as number;
       }
     } catch (e) {
       // Block number not critical

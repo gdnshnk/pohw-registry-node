@@ -6,7 +6,7 @@
 import { Router, Request, Response } from 'express';
 import { RegistryDatabase } from './database';
 import { BatchManager } from './batcher';
-import { AttestationRequest, AttestationReceipt, VerificationResult, RegistryStatus, MerkleProof } from './types';
+import { AttestationRequest, AttestationReceipt, VerificationResult, RegistryStatus, MerkleProof, ChallengeRequest, ChallengeResponse, ChallengeResolutionRequest, ChallengeRecord } from './types';
 import { createHash } from 'crypto';
 import { anchorMerkleRoot, AnchorPayload } from './anchoring';
 import { ProcessSession, ProcessDigest, generateCompoundHash } from './process-layer';
@@ -14,56 +14,72 @@ import { DIDManager, generateDIDFromKeypair, isValidDID, parseDID } from './did'
 import { AttestorManager } from './attestors';
 import { createPAVClaimFromProof, PAVClaimBuilder, PAVClaimValidator, PAVClaimParser } from './pav';
 import { FraudMitigationManager } from './fraud-mitigation';
+import { IPFSSnapshotService } from './ipfs-snapshots';
+import { RegistrySynchronizationService } from './registry-sync';
 
 export function createAPIRouter(
   db: RegistryDatabase, 
   batcher: BatchManager,
-  anchorConfig?: any
+  anchorConfig?: any,
+  snapshotService?: IPFSSnapshotService,
+  syncService?: RegistrySynchronizationService
 ): Router {
   const router = Router();
   
   // Initialize DID manager with database-backed storage
   const didManager = new DIDManager();
   
-  // Load existing DID documents from database into manager
-  const existingDIDs = db.getAllDIDDocuments();
-  existingDIDs.forEach(doc => {
-    didManager.storeDIDDocument(doc);
-  });
+  // Load existing DID documents from database into manager (async initialization)
+  (async () => {
+    try {
+      const existingDIDs = await db.getAllDIDDocuments();
+      existingDIDs.forEach(doc => {
+        didManager.storeDIDDocument(doc);
+      });
+    } catch (err) {
+      console.warn('[API] Failed to load DID documents:', err);
+    }
+  })();
 
   // Initialize Attestor Manager with database-backed storage
   const attestorManager = new AttestorManager();
   
-  // Load existing attestors from database
-  const existingAttestors = db.getAllAttestors();
-  existingAttestors.forEach(attestor => {
-    attestorManager.registerAttestor(
-      attestor.did,
-      attestor.name,
-      attestor.type,
-      attestor.publicKey,
-      attestor.publicKeyUrl,
-      attestor.metadata
-    );
-    if (attestor.status === 'active') {
-      attestorManager.approveAttestor(attestor.did, attestor.nextAuditDue);
-    }
-  });
-
-  // Create mock attestors if none exist (for development/testing)
-  if (existingAttestors.length === 0 && process.env.NODE_ENV !== 'production') {
-    const { createMockAttestors } = require('./mock-attestors');
-    createMockAttestors(attestorManager).then(() => {
-      // Store mock attestors in database
-      const mockAttestors = attestorManager.getActiveAttestors();
-      mockAttestors.forEach(attestor => {
-        db.storeAttestor(attestor.did, attestor);
+  // Load existing attestors from database (async initialization)
+  (async () => {
+    try {
+      const existingAttestors = await db.getAllAttestors();
+      existingAttestors.forEach(attestor => {
+        attestorManager.registerAttestor(
+          attestor.did,
+          attestor.name,
+          attestor.type,
+          attestor.publicKey,
+          attestor.publicKeyUrl,
+          attestor.metadata
+        );
+        if (attestor.status === 'active') {
+          attestorManager.approveAttestor(attestor.did, attestor.nextAuditDue);
+        }
       });
-      console.log('[API] Mock attestors initialized for testing');
-    }).catch((err: any) => {
-      console.warn('[API] Failed to create mock attestors:', err);
-    });
-  }
+
+      // Create mock attestors if none exist (for development/testing)
+      if (existingAttestors.length === 0 && process.env.NODE_ENV !== 'production') {
+        const { createMockAttestors } = require('./mock-attestors');
+        createMockAttestors(attestorManager).then(async () => {
+          // Store mock attestors in database
+          const mockAttestors = attestorManager.getActiveAttestors();
+          for (const attestor of mockAttestors) {
+            await db.storeAttestor(attestor.did, attestor);
+          }
+          console.log('[API] Mock attestors initialized for testing');
+        }).catch((err: any) => {
+          console.warn('[API] Failed to create mock attestors:', err);
+        });
+      }
+    } catch (err) {
+      console.warn('[API] Failed to load attestors:', err);
+    }
+  })();
 
   // Initialize Fraud Mitigation Manager with database-backed storage
   const fraudMitigation = new FraudMitigationManager(db);
@@ -84,7 +100,7 @@ export function createAPIRouter(
       }
 
       // Check if proof already exists
-      const existing = db.getProofByHash(request.hash);
+      const existing = await db.getProofByHash(request.hash);
       if (existing) {
         return res.status(409).json({
           error: 'Proof already exists',
@@ -107,11 +123,10 @@ export function createAPIRouter(
 
       // Verify attestor credentials and determine tier (following whitepaper Section 3.3)
       // Get assistance profile from request (user-selected or auto-detected)
-      // Default to 'human-only' if not specified and process digest exists
-      let assistanceProfile = request.assistanceProfile || 
-        (request.processDigest ? 'human-only' : undefined);
+      // DON'T default here - let it be determined later to respect user selection
+      let assistanceProfile = request.assistanceProfile;
       
-      // Determine tier based on credentials
+      // Determine tier based on credentials (use assistance profile if provided)
       const tier = attestorManager.determineTierFromCredentials(
         request.did,
         assistanceProfile as 'human-only' | 'AI-assisted' | 'AI-generated' | undefined
@@ -149,30 +164,48 @@ export function createAPIRouter(
         // If process metrics don't meet thresholds and no assistance profile is specified,
         // we should default to 'AI-assisted' or 'AI-generated' based on the metrics.
         
-        // Assistance profile should already be determined from actual data on client side
-        // If not provided, determine from process metrics
-        if (!request.assistanceProfile && request.processMetrics) {
-          if (request.processMetrics.meetsThresholds) {
-            request.assistanceProfile = 'human-only';
-          } else {
-            // Determine based on how far off the metrics are
-            const entropy = request.processMetrics.entropy || 0;
-            const duration = request.processMetrics.duration || 0;
-            const inputEvents = request.processMetrics.inputEvents || 0;
-            
-            if (entropy < 0.1 && duration < 5000 && inputEvents < 5) {
-              request.assistanceProfile = 'AI-generated';
+        // IMPORTANT: User's explicit selection takes precedence (per whitepaper ethical compliance)
+        // Only auto-determine if user hasn't explicitly selected one
+        if (request.assistanceProfile) {
+          // User explicitly selected - use their selection (respects ethical compliance)
+          assistanceProfile = request.assistanceProfile;
+          console.log(`[Attest] Using user-selected assistance profile: ${assistanceProfile} for DID ${request.did}`);
+        } else {
+          // No user selection - determine from process metrics
+          if (request.processMetrics) {
+            if (request.processMetrics.meetsThresholds) {
+              assistanceProfile = 'human-only';
             } else {
-              request.assistanceProfile = 'AI-assisted';
+              // Determine based on how far off the metrics are
+              const entropy = request.processMetrics.entropy || 0;
+              const duration = request.processMetrics.duration || 0;
+              const inputEvents = request.processMetrics.inputEvents || 0;
+              
+              if (entropy < 0.1 && duration < 5000 && inputEvents < 5) {
+                assistanceProfile = 'AI-generated';
+              } else {
+                assistanceProfile = 'AI-assisted';
+              }
             }
+            console.log(`[Attest] Auto-determined assistance profile from data: ${assistanceProfile} for DID ${request.did}`);
+          } else {
+            // No process metrics - default to human-only if process digest exists
+            assistanceProfile = request.processDigest ? 'human-only' : undefined;
           }
-          console.log(`[Attest] Determined assistance profile from data: ${request.assistanceProfile} for DID ${request.did}`);
         }
       }
 
       // Store proof with tier
       // Store with ORIGINAL content hash (not compound hash) so verification works
-      const proofId = db.storeProof({
+      // Use the assistance profile (user-selected takes precedence, then auto-detected, then default)
+      // IMPORTANT: User's explicit selection is always respected (per whitepaper ethical compliance)
+      // CRITICAL: Use request.assistanceProfile if provided (user's explicit selection), otherwise use auto-determined
+      const storedAssistanceProfile = request.assistanceProfile || assistanceProfile || 
+        (request.processDigest ? 'human-only' : undefined);
+      
+      console.log(`[Attest] Storing proof with assistance profile: ${storedAssistanceProfile} (user selected: ${request.assistanceProfile}, final: ${assistanceProfile})`);
+      
+      const proofId = await db.storeProof({
         hash: finalHash, // Original content hash (allows verification by content hash)
         signature: request.signature,
         did: request.did,
@@ -183,7 +216,15 @@ export function createAPIRouter(
         zk_proof: request.zkProof ? JSON.stringify(request.zkProof) : undefined,
         tier: tier,
         authored_on_device: request.authoredOnDevice,
-        environment_attestation: request.environmentAttestation ? JSON.stringify(request.environmentAttestation) : undefined
+        environment_attestation: request.environmentAttestation ? JSON.stringify(request.environmentAttestation) : undefined,
+        derived_from: request.derivedFrom ? JSON.stringify(
+          // Handle both simple (string/string[]) and structured (object[]) formats
+          Array.isArray(request.derivedFrom) && request.derivedFrom.length > 0 && typeof request.derivedFrom[0] === 'object'
+            ? request.derivedFrom  // Structured format
+            : (Array.isArray(request.derivedFrom) ? request.derivedFrom : [request.derivedFrom])  // Simple format
+        ) : undefined,
+        assistance_profile: storedAssistanceProfile,
+        claim_uri: request.claimURI // Content archive URI (IPFS/Arweave) - per whitepaper Section 7.3
       });
 
       // Record submission (fraud mitigation)
@@ -194,7 +235,7 @@ export function createAPIRouter(
       const receiptHash = '0x' + createHash('sha256').update(receiptData).digest('hex');
 
       // Check if we should create a batch
-      if (batcher.shouldCreateBatch()) {
+      if (await batcher.shouldCreateBatch()) {
         await batcher.createBatch();
       }
 
@@ -221,7 +262,7 @@ export function createAPIRouter(
   router.post('/pohw/batch/anchor/:batchId', async (req: Request, res: Response) => {
     try {
       const batchId = req.params.batchId;
-      const batch = db.getLatestBatch();
+      const batch = await db.getLatestBatch();
       
       if (!batch || batch.id !== batchId) {
         return res.status(404).json({
@@ -254,7 +295,7 @@ export function createAPIRouter(
         }));
 
       if (anchors.length > 0) {
-        db.updateBatchAnchors(batchId, anchors);
+        await db.updateBatchAnchors(batchId, anchors);
       }
 
       // Enhance results with explorer links and summary
@@ -301,7 +342,7 @@ export function createAPIRouter(
   router.get('/pohw/batch/:batchId/anchors', async (req: Request, res: Response) => {
     try {
       const batchId = req.params.batchId;
-      const batch = db.getBatchById(batchId);
+      const batch = await db.getBatchById(batchId);
       
       if (!batch) {
         return res.status(404).json({
@@ -362,7 +403,7 @@ export function createAPIRouter(
    */
   router.post('/pohw/batch/create', async (req: Request, res: Response) => {
     try {
-      const pendingCount = db.getPendingCount();
+      const pendingCount = await db.getPendingCount();
       
       if (pendingCount === 0) {
         return res.status(400).json({
@@ -400,9 +441,9 @@ export function createAPIRouter(
    * Node status endpoint (compatible with gdn.sh format)
    * Must come before /pohw/verify/:hash to avoid route collision
    */
-  router.get('/pohw/verify/index.json', (req: Request, res: Response) => {
+  router.get('/pohw/verify/index.json', async (req: Request, res: Response) => {
     try {
-      const latestBatch = db.getLatestBatch();
+      const latestBatch = await db.getLatestBatch();
       
       // Use authentic batch creation timestamp (PoHW integrity principle)
       // If no batch exists, use current time as fallback
@@ -434,7 +475,7 @@ export function createAPIRouter(
    * GET /pohw/verify/:hash
    * Verify a proof by hash
    */
-  router.get('/pohw/verify/:hash', (req: Request, res: Response) => {
+  router.get('/pohw/verify/:hash', async (req: Request, res: Response) => {
     try {
       let hash = req.params.hash;
       // Normalize hash: ensure it has 0x prefix for lookup
@@ -443,12 +484,12 @@ export function createAPIRouter(
       }
 
       // Look up proof by hash (now stored as original content hash, not compound hash)
-      let proof = db.getProofByHash(hash);
+      let proof = await db.getProofByHash(hash);
 
       // Fallback: If not found, check if any proof has this as compound_hash
       // This handles old proofs that were stored with compound hash as primary hash
       if (!proof) {
-        proof = db.getProofByCompoundHash(hash);
+        proof = await db.getProofByCompoundHash(hash);
       }
 
       if (!proof) {
@@ -461,14 +502,29 @@ export function createAPIRouter(
       // Get Merkle proof if batched
       let merkleProof: string[] | undefined;
       let merkleRoot: string | undefined;
+      let batchSize: number | undefined;
+      let batchStatus: 'pending' | 'batched' = 'pending';
 
       if (proof.batch_id) {
-        const merkle = batcher.getMerkleProof(hash);
+        // Proof is batched
+        batchStatus = 'batched';
+        const batch = await db.getBatchById(proof.batch_id);
+        if (batch) {
+          batchSize = batch.size;
+        }
+        
+        const merkle = await batcher.getMerkleProof(hash);
         if (merkle) {
           merkleProof = merkle.proof;
           merkleRoot = merkle.root;
         }
+      } else {
+        // Proof is pending batching
+        batchStatus = 'pending';
       }
+
+      // Get pending count for transparency
+      const pendingCount = await db.getPendingCount();
 
       const result: VerificationResult = {
         valid: true,
@@ -476,7 +532,13 @@ export function createAPIRouter(
         timestamp: proof.timestamp,
         registry: 'proofofhumanwork.org',
         merkle_proof: merkleProof,
-        merkle_root: merkleRoot
+        merkle_root: merkleRoot,
+        batch_id: proof.batch_id,
+        batch_size: batchSize,
+        merkle_index: proof.merkle_index,
+        batch_status: batchStatus,
+        pending_count: pendingCount,
+        proof: proof  // Include full proof record for structured derivedFrom access
       };
 
       res.json(result);
@@ -494,7 +556,7 @@ export function createAPIRouter(
    * Get all proofs for a hash (with optional filtering)
    * Query params: did, tier, from, to, sort, limit, offset
    */
-  router.get('/pohw/proofs/:hash', (req: Request, res: Response) => {
+  router.get('/pohw/proofs/:hash', async (req: Request, res: Response) => {
     try {
       let hash = req.params.hash;
       if (!hash.startsWith('0x')) {
@@ -502,7 +564,7 @@ export function createAPIRouter(
       }
 
       // Get all proofs for this hash
-      let proofs = db.getAllProofsByHash(hash);
+      let proofs = await db.getAllProofsByHash(hash);
 
       if (proofs.length === 0) {
         return res.status(404).json({
@@ -561,12 +623,12 @@ export function createAPIRouter(
       const paginatedProofs = proofs.slice(offsetNum, offsetNum + limitNum);
 
       // Get Merkle proofs for each
-      const proofsWithMerkle = paginatedProofs.map(proof => {
+      const proofsWithMerkle = await Promise.all(paginatedProofs.map(async (proof) => {
         let merkleProof: string[] | undefined;
         let merkleRoot: string | undefined;
 
         if (proof.batch_id) {
-          const merkle = batcher.getMerkleProof(proof.hash);
+          const merkle = await batcher.getMerkleProof(proof.hash);
           if (merkle) {
             merkleProof = merkle.proof;
             merkleRoot = merkle.root;
@@ -585,7 +647,7 @@ export function createAPIRouter(
           merkle_proof: merkleProof,
           merkle_root: merkleRoot
         };
-      });
+      }));
 
       res.json({
         hash,
@@ -608,14 +670,14 @@ export function createAPIRouter(
    * GET /pohw/proof/:hash
    * Get Merkle proof for a hash
    */
-  router.get('/pohw/proof/:hash', (req: Request, res: Response) => {
+  router.get('/pohw/proof/:hash', async (req: Request, res: Response) => {
     try {
       let hash = req.params.hash;
       // Normalize hash: ensure it has 0x prefix for lookup
       if (!hash.startsWith('0x')) {
         hash = '0x' + hash;
       }
-      const merkle = batcher.getMerkleProof(hash);
+      const merkle = await batcher.getMerkleProof(hash);
 
       if (!merkle) {
         return res.status(404).json({
@@ -624,11 +686,11 @@ export function createAPIRouter(
       }
 
       // Get anchor information from batch
-      const proofRecord = db.getProofByHash(hash);
+      const proofRecord = await db.getProofByHash(hash);
       let anchors: Array<{ chain: string; tx: string; block?: number }> = [];
       
       if (proofRecord?.batch_id) {
-        const batch = db.getBatchById(proofRecord.batch_id);
+        const batch = await db.getBatchById(proofRecord.batch_id);
         if (batch?.anchor_tx) {
           try {
             anchors = JSON.parse(batch.anchor_tx);
@@ -652,7 +714,7 @@ export function createAPIRouter(
         if (!normalizedHash.startsWith('0x')) {
           normalizedHash = '0x' + normalizedHash;
         }
-        const proofRecord = db.getProofByHash(normalizedHash);
+        const proofRecord = await db.getProofByHash(normalizedHash);
         if (proofRecord) {
           // Create PAV claim using builder
           const builder = new PAVClaimBuilder();
@@ -672,16 +734,19 @@ export function createAPIRouter(
           }
 
           // Extract entropy and temporal coherence from process metrics
+          // Always extract and format according to whitepaper: zkp:entropy>X and zkp:coherence>X
           let entropyProof: string | undefined;
           let temporalCoherence: string | undefined;
           if (proofRecord.process_metrics) {
             try {
               const metrics = JSON.parse(proofRecord.process_metrics);
-              if (metrics.entropy !== undefined && metrics.entropy >= 0.3) {
-                entropyProof = 'entropy-verified';
+              // Always format entropy (even if low) - whitepaper format: zkp:entropy>X
+              if (metrics.entropy !== undefined) {
+                entropyProof = `zkp:entropy>${metrics.entropy.toFixed(3)}`;
               }
+              // Always format temporal coherence (even if low) - whitepaper format: zkp:coherence>X
               if (metrics.temporalCoherence !== undefined) {
-                temporalCoherence = metrics.temporalCoherence.toString();
+                temporalCoherence = `zkp:coherence>${metrics.temporalCoherence.toFixed(3)}`;
               }
             } catch (e) {
               // Ignore parse errors
@@ -718,8 +783,10 @@ export function createAPIRouter(
             builder.setAnchors(anchors);
           }
 
-          // Set assistance profile (default to human-only)
-          builder.setAssistanceProfile('human-only');
+          // Set assistance profile from stored value (respects user declaration)
+          const storedAssistanceProfile = proofRecord.assistance_profile || 'human-only';
+          console.log(`[Claim] Retrieving assistance profile for hash ${hash}: ${storedAssistanceProfile} (stored in DB: ${proofRecord.assistance_profile})`);
+          builder.setAssistanceProfile(storedAssistanceProfile);
 
           // Use tier from proof record (determined from credentials) or fall back to reputation
           let tier: string = 'grey';
@@ -776,7 +843,7 @@ export function createAPIRouter(
    * GET /pohw/claim/:hash
    * Get PAV claim object for a hash (JSON-LD format)
    */
-  router.get('/pohw/claim/:hash', (req: Request, res: Response) => {
+  router.get('/pohw/claim/:hash', async (req: Request, res: Response) => {
     try {
       let hash = req.params.hash;
       // Normalize hash: ensure it has 0x prefix for lookup
@@ -784,7 +851,7 @@ export function createAPIRouter(
         hash = '0x' + hash;
       }
       
-      const proofRecord = db.getProofByHash(hash);
+      const proofRecord = await db.getProofByHash(hash);
 
       if (!proofRecord) {
         return res.status(404).json({
@@ -794,11 +861,11 @@ export function createAPIRouter(
       }
 
       // Get Merkle proof if available
-      const merkle = batcher.getMerkleProof(hash);
+      const merkle = await batcher.getMerkleProof(hash);
       let anchors: Array<{ chain: string; tx: string; block?: number }> = [];
       
       if (proofRecord.batch_id) {
-        const batch = db.getBatchById(proofRecord.batch_id);
+        const batch = await db.getBatchById(proofRecord.batch_id);
         if (batch?.anchor_tx) {
           try {
             anchors = JSON.parse(batch.anchor_tx);
@@ -880,6 +947,18 @@ export function createAPIRouter(
         }
       }
 
+          // Add derivedFrom (pav:derivedFrom) for citations/quotes
+          if (proofRecord.derived_from) {
+            try {
+              const derivedFrom = JSON.parse(proofRecord.derived_from);
+              // setDerivedFrom handles both structured (object[]) and simple (string[]) formats
+              // It will extract sources from structured format automatically
+              builder.setDerivedFrom(derivedFrom);
+            } catch (e) {
+              // Ignore parse errors
+            }
+          }
+
       // Add ZK-SNARK proof if available
       if (zkProof) {
         builder.setCustomField('pav:zkProof', zkProof);
@@ -893,11 +972,14 @@ export function createAPIRouter(
         builder.setAnchors(anchors);
       }
 
-      // Set assistance profile (default to human-only if process digest exists)
-      if (proofRecord.process_digest) {
-        builder.setAssistanceProfile('human-only');
-      } else {
-        builder.setAssistanceProfile('human-only'); // Default
+      // Set assistance profile from stored value (respects user declaration)
+      const storedAssistanceProfile = proofRecord.assistance_profile || 'human-only';
+      console.log(`[Proof] Retrieving assistance profile for hash ${hash}: ${storedAssistanceProfile} (stored in DB: ${proofRecord.assistance_profile})`);
+      builder.setAssistanceProfile(storedAssistanceProfile);
+
+      // Add content archive URI (pohw:claimURI) - per whitepaper Section 7.3
+      if (proofRecord.claim_uri) {
+        builder.setClaimURI(proofRecord.claim_uri);
       }
 
       // Use tier from proof record (determined from credentials) or fall back to reputation
@@ -975,7 +1057,7 @@ export function createAPIRouter(
    * GET /pohw/did/:did
    * Resolve DID to DID Document (W3C DID Resolution)
    */
-  router.get('/pohw/did/:did', (req: Request, res: Response) => {
+  router.get('/pohw/did/:did', async (req: Request, res: Response) => {
     try {
       const did = req.params.did;
 
@@ -988,7 +1070,7 @@ export function createAPIRouter(
       }
 
       // Resolve DID document from database
-      const document = db.getDIDDocument(did);
+      const document = await db.getDIDDocument(did);
 
       if (!document) {
         return res.status(404).json({
@@ -1012,7 +1094,7 @@ export function createAPIRouter(
    * POST /pohw/did
    * Register a new DID document
    */
-  router.post('/pohw/did', (req: Request, res: Response) => {
+  router.post('/pohw/did', async (req: Request, res: Response) => {
     try {
       const document = req.body as any;
 
@@ -1033,7 +1115,7 @@ export function createAPIRouter(
       }
 
       // Check if DID already exists
-      const existing = db.getDIDDocument(document.id);
+      const existing = await db.getDIDDocument(document.id);
       if (existing) {
         return res.status(409).json({
           error: 'DID already exists',
@@ -1043,7 +1125,7 @@ export function createAPIRouter(
 
       // Store DID document in both manager and database
       didManager.storeDIDDocument(document);
-      db.storeDIDDocument(document.id, document);
+      await db.storeDIDDocument(document.id, document);
 
       // Create KCG node
       const verificationMethod = document.verificationMethod[0];
@@ -1060,7 +1142,7 @@ export function createAPIRouter(
         status: 'active' as const
       };
 
-      db.storeKCGNode(document.id, kcgNode);
+      await db.storeKCGNode(document.id, kcgNode);
 
       res.status(201).json({
         did: document.id,
@@ -1092,7 +1174,7 @@ export function createAPIRouter(
       }
 
       // Get old DID document
-      const oldDocument = db.getDIDDocument(oldDID);
+      const oldDocument = await db.getDIDDocument(oldDID);
       if (!oldDocument) {
         return res.status(404).json({
           error: 'Old DID not found',
@@ -1113,13 +1195,13 @@ export function createAPIRouter(
 
       // Store new DID document in both manager and database
       didManager.storeDIDDocument(rotation.document);
-      db.storeDIDDocument(rotation.newDID.did, rotation.document);
+      await db.storeDIDDocument(rotation.newDID.did, rotation.document);
 
       // Update KCG
-      const oldNode = db.getKCGNode(oldDID);
+      const oldNode = await db.getKCGNode(oldDID);
       if (oldNode) {
         oldNode.status = 'rotated';
-        db.storeKCGNode(oldDID, oldNode);
+        await db.storeKCGNode(oldDID, oldNode);
       }
 
       // Create new KCG node
@@ -1128,7 +1210,7 @@ export function createAPIRouter(
         .update(verificationMethod.publicKeyHex || verificationMethod.publicKeyMultibase)
         .digest('hex');
 
-      db.storeKCGNode(rotation.newDID.did, {
+      await db.storeKCGNode(rotation.newDID.did, {
         did: rotation.newDID.did,
         keyFingerprint,
         previousNode: oldDID,
@@ -1156,7 +1238,7 @@ export function createAPIRouter(
    * GET /pohw/did/:did/continuity
    * Get Key Continuity Graph for a DID
    */
-  router.get('/pohw/did/:did/continuity', (req: Request, res: Response) => {
+  router.get('/pohw/did/:did/continuity', async (req: Request, res: Response) => {
     try {
       const did = req.params.did;
 
@@ -1166,7 +1248,7 @@ export function createAPIRouter(
         });
       }
 
-      const chain = db.getContinuityChain(did);
+      const chain = await db.getContinuityChain(did);
 
       if (chain.length === 0) {
         return res.status(404).json({
@@ -1210,7 +1292,7 @@ export function createAPIRouter(
    * POST /pohw/attestors/register
    * Register a new attestor (requires Foundation approval)
    */
-  router.post('/pohw/attestors/register', (req: Request, res: Response) => {
+  router.post('/pohw/attestors/register', async (req: Request, res: Response) => {
     try {
       const { did, name, type, publicKey, publicKeyUrl, metadata } = req.body;
 
@@ -1230,8 +1312,8 @@ export function createAPIRouter(
       );
 
       // Store in database
-      db.storeAttestor(did, record);
-      db.appendAuditLog({
+      await db.storeAttestor(did, record);
+      await db.appendAuditLog({
         timestamp: new Date().toISOString(),
         action: 'status_changed',
         attestorDID: did,
@@ -1255,14 +1337,14 @@ export function createAPIRouter(
    * POST /pohw/attestors/:did/approve
    * Approve an attestor (Foundation action)
    */
-  router.post('/pohw/attestors/:did/approve', (req: Request, res: Response) => {
+  router.post('/pohw/attestors/:did/approve', async (req: Request, res: Response) => {
     try {
       const { did } = req.params;
       const { nextAuditDue } = req.body;
 
       const record = attestorManager.approveAttestor(did, nextAuditDue);
-      db.storeAttestor(did, record);
-      db.appendAuditLog({
+      await db.storeAttestor(did, record);
+      await db.appendAuditLog({
         timestamp: new Date().toISOString(),
         action: 'status_changed',
         attestorDID: did,
@@ -1312,7 +1394,7 @@ export function createAPIRouter(
    * POST /pohw/attestors/credentials/issue
    * Issue a Verifiable Human Credential
    */
-  router.post('/pohw/attestors/credentials/issue', (req: Request, res: Response) => {
+  router.post('/pohw/attestors/credentials/issue', async (req: Request, res: Response) => {
     try {
       const { attestorDID, subjectDID, verificationMethod, assuranceLevel, policy, expirationDate } = req.body;
 
@@ -1333,8 +1415,8 @@ export function createAPIRouter(
 
       // Store in database
       if (credential.credentialHash) {
-        db.storeCredential(credential.credentialHash, credential);
-        db.appendAuditLog({
+        await db.storeCredential(credential.credentialHash, credential);
+        await db.appendAuditLog({
           timestamp: new Date().toISOString(),
           action: 'credential_issued',
           credentialHash: credential.credentialHash,
@@ -1394,7 +1476,7 @@ export function createAPIRouter(
    * POST /pohw/attestors/credentials/:hash/revoke
    * Revoke a credential
    */
-  router.post('/pohw/attestors/credentials/:hash/revoke', (req: Request, res: Response) => {
+  router.post('/pohw/attestors/credentials/:hash/revoke', async (req: Request, res: Response) => {
     try {
       const { hash } = req.params;
       const { attestorDID, reason, metadata } = req.body;
@@ -1501,11 +1583,11 @@ export function createAPIRouter(
    * GET /pohw/status
    * Get registry status
    */
-  router.get('/pohw/status', (req: Request, res: Response) => {
+  router.get('/pohw/status', async (req: Request, res: Response) => {
     try {
-      const latestBatch = db.getLatestBatch();
-      const totalProofs = db.getTotalProofs();
-      const pendingCount = db.getPendingCount();
+      const latestBatch = await db.getLatestBatch();
+      const totalProofs = await db.getTotalProofs();
+      const pendingCount = await db.getPendingCount();
 
       // Use authentic batch creation timestamp (PoHW integrity principle)
       // If no batch exists, use current time as fallback
@@ -1585,6 +1667,306 @@ export function createAPIRouter(
       });
     } catch (error: any) {
       console.error('Get all reputation error:', error);
+      res.status(500).json({
+        error: 'Internal server error',
+        message: error.message
+      });
+    }
+  });
+
+  /**
+   * POST /pohw/proofs/:hash/challenge
+   * Submit a cryptographic challenge against a suspicious proof (Section 8.5)
+   */
+  router.post('/pohw/proofs/:hash/challenge', async (req: Request, res: Response) => {
+    try {
+      const proofHash = req.params.hash;
+      const challengeRequest: ChallengeRequest = req.body;
+
+      // Validate request
+      if (!challengeRequest.challenger_did || !challengeRequest.reason || !challengeRequest.description) {
+        return res.status(400).json({
+          error: 'Missing required fields: challenger_did, reason, description'
+        });
+      }
+
+      // Verify proof exists
+      let normalizedHash = proofHash;
+      if (!normalizedHash.startsWith('0x')) {
+        normalizedHash = '0x' + normalizedHash;
+      }
+      const proof = await db.getProofByHash(normalizedHash);
+      if (!proof) {
+        return res.status(404).json({
+          error: 'Proof not found'
+        });
+      }
+
+      // Verify challenger is not the author (can't challenge your own proof)
+      if (challengeRequest.challenger_did === proof.did) {
+        return res.status(400).json({
+          error: 'Cannot challenge your own proof'
+        });
+      }
+
+      // Create challenge record
+      const challenge: Omit<ChallengeRecord, 'id'> = {
+        proof_hash: normalizedHash,
+        proof_did: proof.did,
+        challenger_did: challengeRequest.challenger_did,
+        reason: challengeRequest.reason,
+        description: challengeRequest.description,
+        evidence: challengeRequest.evidence ? JSON.stringify(challengeRequest.evidence) : undefined,
+        status: 'pending',
+        created_at: new Date().toISOString()
+      };
+
+      const challengeId = await db.storeChallenge(challenge);
+
+      // Log to transparency log
+      await db.appendTransparencyLog({
+        type: 'challenge_submitted',
+        challenge_id: challengeId,
+        proof_hash: normalizedHash,
+        did: challengeRequest.challenger_did,
+        timestamp: new Date().toISOString(),
+        details: {
+          reason: challengeRequest.reason,
+          description: challengeRequest.description
+        }
+      });
+
+      res.status(201).json({
+        challenge_id: challengeId,
+        status: 'pending',
+        message: 'Challenge submitted successfully. Author will be notified and can respond.'
+      });
+    } catch (error: any) {
+      console.error('Challenge submission error:', error);
+      res.status(500).json({
+        error: 'Internal server error',
+        message: error.message
+      });
+    }
+  });
+
+  /**
+   * GET /pohw/proofs/:hash/challenges
+   * Get all challenges for a proof hash
+   */
+  router.get('/pohw/proofs/:hash/challenges', async (req: Request, res: Response) => {
+    try {
+      let proofHash = req.params.hash;
+      if (!proofHash.startsWith('0x')) {
+        proofHash = '0x' + proofHash;
+      }
+
+      const challenges = await db.getChallengesByProofHash(proofHash);
+      res.json({
+        proof_hash: proofHash,
+        total: challenges.length,
+        challenges: challenges
+      });
+    } catch (error: any) {
+      console.error('Get challenges error:', error);
+      res.status(500).json({
+        error: 'Internal server error',
+        message: error.message
+      });
+    }
+  });
+
+  /**
+   * POST /pohw/challenges/:challengeId/respond
+   * Author responds to a challenge
+   */
+  router.post('/pohw/challenges/:challengeId/respond', async (req: Request, res: Response) => {
+    try {
+      const challengeId = req.params.challengeId;
+      const response: ChallengeResponse = req.body;
+
+      // Validate request
+      if (!response.author_did || !response.response) {
+        return res.status(400).json({
+          error: 'Missing required fields: author_did, response'
+        });
+      }
+
+      // Get challenge
+      const challenge = await db.getChallengeById(challengeId);
+      if (!challenge) {
+        return res.status(404).json({
+          error: 'Challenge not found'
+        });
+      }
+
+      // Verify author matches proof author
+      if (response.author_did !== challenge.proof_did) {
+        return res.status(403).json({
+          error: 'Only the proof author can respond to this challenge'
+        });
+      }
+
+      // Verify challenge is still pending
+      if (challenge.status !== 'pending') {
+        return res.status(400).json({
+          error: `Challenge is already ${challenge.status}, cannot respond`
+        });
+      }
+
+      // Update challenge with response
+      await db.updateChallenge(challengeId, {
+        status: 'responded',
+        author_response: response.response,
+        responded_at: new Date().toISOString(),
+        evidence: response.evidence ? JSON.stringify(response.evidence) : challenge.evidence
+      });
+
+      // Log to transparency log
+      await db.appendTransparencyLog({
+        type: 'challenge_responded',
+        challenge_id: challengeId,
+        proof_hash: challenge.proof_hash,
+        did: response.author_did,
+        timestamp: new Date().toISOString(),
+        details: {
+          response: response.response
+        }
+      });
+
+      res.json({
+        challenge_id: challengeId,
+        status: 'responded',
+        message: 'Response submitted successfully. Challenge is now awaiting resolution.'
+      });
+    } catch (error: any) {
+      console.error('Challenge response error:', error);
+      res.status(500).json({
+        error: 'Internal server error',
+        message: error.message
+      });
+    }
+  });
+
+  /**
+   * POST /pohw/challenges/:challengeId/resolve
+   * Resolve a challenge (arbitration - typically by Foundation or authorized arbitrator)
+   */
+  router.post('/pohw/challenges/:challengeId/resolve', async (req: Request, res: Response) => {
+    try {
+      const challengeId = req.params.challengeId;
+      const resolutionRequest: ChallengeResolutionRequest = req.body;
+
+      // Validate request
+      if (!resolutionRequest.resolver_did || !resolutionRequest.resolution || !resolutionRequest.notes) {
+        return res.status(400).json({
+          error: 'Missing required fields: resolver_did, resolution, notes'
+        });
+      }
+
+      // Get challenge
+      const challenge = await db.getChallengeById(challengeId);
+      if (!challenge) {
+        return res.status(404).json({
+          error: 'Challenge not found'
+        });
+      }
+
+      // Verify challenge can be resolved
+      if (challenge.status === 'resolved' || challenge.status === 'dismissed') {
+        return res.status(400).json({
+          error: `Challenge is already ${challenge.status}`
+        });
+      }
+
+      // Update challenge with resolution
+      await db.updateChallenge(challengeId, {
+        status: 'resolved',
+        resolution: resolutionRequest.resolution,
+        resolver_did: resolutionRequest.resolver_did,
+        resolution_notes: resolutionRequest.notes,
+        resolved_at: new Date().toISOString()
+      });
+
+      // Update reputation based on resolution
+      if (resolutionRequest.resolution === 'confirmed') {
+        // Fraud confirmed - update reputation
+        fraudMitigation.updateReputation(challenge.proof_did, 'revocation');
+      } else if (resolutionRequest.resolution === 'exonerated') {
+        // Author cleared - no reputation penalty
+        // Could add positive reputation boost here if desired
+      }
+
+      // Log to transparency log
+      await db.appendTransparencyLog({
+        type: 'challenge_resolved',
+        challenge_id: challengeId,
+        proof_hash: challenge.proof_hash,
+        did: resolutionRequest.resolver_did,
+        resolution: resolutionRequest.resolution,
+        timestamp: new Date().toISOString(),
+        details: {
+          notes: resolutionRequest.notes,
+          proof_did: challenge.proof_did,
+          challenger_did: challenge.challenger_did
+        }
+      });
+
+      res.json({
+        challenge_id: challengeId,
+        status: 'resolved',
+        resolution: resolutionRequest.resolution,
+        message: `Challenge resolved as ${resolutionRequest.resolution}. Outcome recorded in transparency log.`
+      });
+    } catch (error: any) {
+      console.error('Challenge resolution error:', error);
+      res.status(500).json({
+        error: 'Internal server error',
+        message: error.message
+      });
+    }
+  });
+
+  /**
+   * GET /pohw/challenges/:challengeId
+   * Get challenge details
+   */
+  router.get('/pohw/challenges/:challengeId', async (req: Request, res: Response) => {
+    try {
+      const challengeId = req.params.challengeId;
+      const challenge = await db.getChallengeById(challengeId);
+      
+      if (!challenge) {
+        return res.status(404).json({
+          error: 'Challenge not found'
+        });
+      }
+
+      res.json(challenge);
+    } catch (error: any) {
+      console.error('Get challenge error:', error);
+      res.status(500).json({
+        error: 'Internal server error',
+        message: error.message
+      });
+    }
+  });
+
+  /**
+   * GET /pohw/transparency-log
+   * Get transparency log (public dispute outcomes)
+   */
+  router.get('/pohw/transparency-log', async (req: Request, res: Response) => {
+    try {
+      const limit = parseInt(req.query.limit as string, 10) || 100;
+      const log = await db.getTransparencyLog(limit);
+      
+      res.json({
+        total: log.length,
+        entries: log
+      });
+    } catch (error: any) {
+      console.error('Get transparency log error:', error);
       res.status(500).json({
         error: 'Internal server error',
         message: error.message
