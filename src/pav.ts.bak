@@ -636,18 +636,6 @@ export function createPAVClaimFromProof(
 }
 
 
-    builder.setAuthoredOnDevice(deviceId);
-  }
-
-  if (environmentAttestation) {
-    builder.setEnvironmentAttestation(environmentAttestation);
-  }
-
-  if (entropyProof) {
-    builder.setEntropyProof(entropyProof);
-  }
-
-  if (temporalCoherence) {
     builder.setTemporalCoherence(temporalCoherence);
   }
 

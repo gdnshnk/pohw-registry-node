@@ -1,72 +1,108 @@
-# Railway Deployment - Quick Setup
+# Railway PostgreSQL Setup Guide
 
-## ✅ What's Already Done
+This guide will help you set up a PostgreSQL database on Railway for the PoHW registry node.
 
-- ✅ Railway CLI installed
-- ✅ Logged in to Railway
-- ✅ Project created: `pohw-registry-node`
-- ✅ Configuration files created:
-  - `railway.json` - Railway settings
-  - `nixpacks.toml` - Build configuration
-  - `package.json` - Updated to create data directory
-- ✅ Code pushed to GitHub: `gdnshnk/pohw-registry-node`
+## Step 1: Create Railway Account (if needed)
 
-## 🔗 Connect Service via Dashboard (Easiest)
+1. Go to [railway.app](https://railway.app)
+2. Sign up or log in with GitHub
 
-### Step 1: Open Railway Dashboard
-Go to: https://railway.com/project/28b4954a-2b43-4095-a1a9-b0afd6dd28af
+## Step 2: Create a New Project
 
-### Step 2: Add GitHub Service
-1. Click the **"+"** button or **"New"** button
-2. Select **"GitHub Repo"**
-3. Choose repository: **`gdnshnk/pohw-registry-node`**
-4. Railway will automatically:
-   - Detect it's a Node.js project
-   - Use `nixpacks.toml` for build
-   - Deploy automatically
+1. Click "New Project"
+2. Select "Empty Project" or "Deploy from GitHub repo" (if you want to deploy the registry node)
 
-### Step 3: Wait for Deployment
-- Railway will build and deploy
-- Watch the logs in the dashboard
-- Should take 2-3 minutes
+## Step 3: Add PostgreSQL Service
 
-### Step 4: Get Public URL
-Once deployed:
-1. Click on the service
-2. Go to **"Settings"** tab
-3. Scroll to **"Networking"**
-4. Click **"Generate Domain"**
-5. Copy the URL (e.g., `https://pohw-registry-node-production.up.railway.app`)
+1. In your project, click "+ New"
+2. Select "Database" → "Add PostgreSQL"
+3. Railway will automatically create a PostgreSQL database
 
-### Step 5: Update Verification Page
-```bash
-cd /Users/gideon/Desktop/pohw/gdn.sh
-./update-registry-url.sh https://YOUR-RAILWAY-URL.railway.app
-git add pohw/verify/index.html
-git commit -m "Connect to deployed registry"
-git push
+## Step 4: Get DATABASE_URL
+
+1. Click on the PostgreSQL service
+2. Go to the "Variables" tab
+3. Find `DATABASE_URL` (or `POSTGRES_URL`)
+4. Copy the connection string
+
+It will look like:
+```
+postgresql://postgres:password@hostname.railway.app:5432/railway
 ```
 
-## 🐛 If Deployment Fails
+## Step 5: Set Environment Variable
 
-Check the logs in Railway dashboard:
-1. Click on the service
-2. Click **"Deployments"** tab
-3. Click on the failed deployment
-4. Check **"Build Logs"** for errors
+### Option A: In Railway (for deployment)
 
-Common fixes:
-- **Missing dependencies**: Already handled by `nixpacks.toml`
-- **Port issues**: Already configured to use `process.env.PORT`
-- **Data directory**: Already handled in `package.json` start script
+1. Go to your registry node service (or create one)
+2. Go to "Variables" tab
+3. Add variable:
+   - Name: `DATABASE_URL`
+   - Value: (paste the PostgreSQL connection string)
 
-## ✅ Verification
+### Option B: Locally (for testing)
 
-Once deployed, test:
 ```bash
-curl https://YOUR-URL.railway.app/health
-curl https://YOUR-URL.railway.app/pohw/status
+export DATABASE_URL="postgresql://postgres:password@hostname.railway.app:5432/railway"
 ```
 
-Both should return JSON responses.
+Or add to your `.env` file:
+```
+DATABASE_URL=postgresql://postgres:password@hostname.railway.app:5432/railway
+```
 
+## Step 6: Test Connection
+
+```bash
+npm run test:postgres
+```
+
+## Step 7: Deploy Registry Node
+
+If deploying the registry node to Railway:
+
+1. Connect your GitHub repo or deploy directly
+2. Set `DATABASE_URL` in service variables
+3. The registry node will automatically:
+   - Detect DATABASE_URL
+   - Use PostgreSQL instead of file-based storage
+   - Initialize schema on first run
+   - Persist data across deployments
+
+## Troubleshooting
+
+### Connection Issues
+
+- Verify DATABASE_URL is correct
+- Check Railway service is running
+- Ensure network connectivity
+- Check Railway service logs
+
+### Schema Issues
+
+- Schema auto-initializes on first connection
+- Check PostgreSQL service logs in Railway
+- Verify user has CREATE TABLE permissions
+
+### Performance
+
+- Railway PostgreSQL is shared by default
+- For production, consider Railway Pro plan
+- Monitor database usage in Railway dashboard
+
+## Security Notes
+
+- Never commit DATABASE_URL to git
+- Use Railway's environment variables
+- Rotate passwords regularly
+- Use Railway's private networking when possible
+
+## Next Steps
+
+After setting up PostgreSQL:
+
+1. ✅ Test connection: `npm run test:postgres`
+2. ✅ Deploy registry node with DATABASE_URL
+3. ✅ Verify data persists across deployments
+4. ✅ Monitor database usage
+5. ✅ Set up backups (Railway handles this automatically)

@@ -1,0 +1,719 @@
+/**
+ * IPFS Snapshot Service
+ * Publishes periodic state snapshots to IPFS per whitepaper Section 12.2
+ * "Each node maintains its own signed transparency log and publishes periodic state snapshots to IPFS"
+ */
+
+import { create } from 'ipfs-http-client';
+import { RegistryDatabase } from './database';
+import { ProofRecord, MerkleBatch } from './types';
+import { createHash } from 'crypto';
+
+export interface SnapshotManifest {
+  /** Snapshot version */
+  version: string;
+  /** Timestamp of snapshot */
+  timestamp: string;
+  /** Registry node identifier */
+  registryId: string;
+  /** Merkle root of all proofs */
+  merkleRoot: string;
+  /** Total number of proofs */
+  totalProofs: number;
+  /** Number of batches */
+  totalBatches: number;
+  /** Latest batch ID */
+  latestBatchId: string | null;
+  /** IPFS CID of the snapshot data */
+  snapshotCid: string;
+  /** IPFS CID of this manifest */
+  manifestCid: string;
+  /** Cryptographic signature of the snapshot */
+  signature?: string;
+}
+
+export interface SnapshotData {
+  /** All proofs in the registry */
+  proofs: ProofRecord[];
+  /** All Merkle batches */
+  batches: MerkleBatch[];
+  /** Latest Merkle root */
+  latestMerkleRoot: string | null;
+  /** Snapshot metadata */
+  metadata: {
+    timestamp: string;
+    registryId: string;
+    totalProofs: number;
+    totalBatches: number;
+  };
+}
+
+export class IPFSSnapshotService {
+  private ipfs: any;
+  private db: RegistryDatabase;
+  private registryId: string;
+  private snapshotInterval: number; // milliseconds
+  private intervalId: NodeJS.Timeout | null = null;
+
+  constructor(
+    db: RegistryDatabase,
+    registryId: string = 'pohw-registry-node',
+    ipfsGatewayUrl: string = 'https://ipfs.io',
+    snapshotInterval: number = 24 * 60 * 60 * 1000 // 24 hours
+  ) {
+    this.db = db;
+    this.registryId = registryId;
+    this.snapshotInterval = snapshotInterval;
+    this.ipfs = null; // Will be initialized lazily when needed
+
+    // Try to initialize IPFS client (non-blocking)
+    this.initializeIPFS(ipfsGatewayUrl);
+  }
+
+  private initializeIPFS(ipfsGatewayUrl: string): void {
+    try {
+      // Use public IPFS gateway or local node
+      const ipfsUrl = process.env.IPFS_URL || ipfsGatewayUrl;
+      
+      // Try to import and create IPFS client
+      // Use require for CJS compatibility
+      const ipfsClient = require('ipfs-http-client');
+      
+      this.ipfs = ipfsClient.create({
+        url: ipfsUrl.includes('://') ? ipfsUrl : `https://${ipfsUrl}`,
+      });
+      console.log(`[IPFS] Connected to IPFS gateway: ${ipfsUrl}`);
+    } catch (error: any) {
+      // If IPFS client is not available, that's okay
+      // The service will handle this gracefully
+      this.ipfs = null;
+      if (process.env.IPFS_ENABLED !== 'false') {
+        console.warn('[IPFS] Failed to initialize IPFS client:', error.message);
+        console.warn('[IPFS] Snapshots will be disabled (set IPFS_ENABLED=false to suppress this warning)');
+      }
+    }
+  }
+
+  /**
+   * Start periodic snapshot publishing
+   */
+  start(): void {
+    if (!this.ipfs) {
+      console.warn('[IPFS] Cannot start snapshots: IPFS not available');
+      return;
+    }
+
+    // Publish initial snapshot
+    this.publishSnapshot().catch(err => {
+      console.error('[IPFS] Initial snapshot failed:', err);
+    });
+
+    // Schedule periodic snapshots
+    this.intervalId = setInterval(() => {
+      this.publishSnapshot().catch(err => {
+        console.error('[IPFS] Periodic snapshot failed:', err);
+      });
+    }, this.snapshotInterval);
+
+    console.log(`[IPFS] Snapshot service started (interval: ${this.snapshotInterval / 1000 / 60} minutes)`);
+  }
+
+  /**
+   * Stop periodic snapshot publishing
+   */
+  stop(): void {
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+      console.log('[IPFS] Snapshot service stopped');
+    }
+  }
+
+  /**
+   * Create and publish a snapshot to IPFS
+   */
+  async publishSnapshot(): Promise<SnapshotManifest> {
+    if (!this.ipfs) {
+      throw new Error('IPFS client not available');
+    }
+
+    console.log('[IPFS] Creating snapshot...');
+
+    // Collect all data
+    const snapshotData = await this.createSnapshotData();
+
+    // Serialize snapshot
+    const snapshotJson = JSON.stringify(snapshotData, null, 2);
+    const snapshotBuffer = Buffer.from(snapshotJson, 'utf8');
+
+    // Upload to IPFS
+    const snapshotResult = await this.ipfs.add(snapshotBuffer, {
+      pin: true, // Pin the content
+      cidVersion: 1, // Use CIDv1 for better compatibility
+    });
+
+    const snapshotCid = snapshotResult.cid.toString();
+    console.log(`[IPFS] Snapshot uploaded: ${snapshotCid}`);
+
+    // Create manifest
+    const manifest: SnapshotManifest = {
+      version: '1.0.0',
+      timestamp: new Date().toISOString(),
+      registryId: this.registryId,
+      merkleRoot: snapshotData.latestMerkleRoot || '0x0',
+      totalProofs: snapshotData.metadata.totalProofs,
+      totalBatches: snapshotData.metadata.totalBatches,
+      latestBatchId: snapshotData.batches.length > 0 ? snapshotData.batches[snapshotData.batches.length - 1].id : null,
+      snapshotCid: snapshotCid,
+      manifestCid: '', // Will be set after manifest is uploaded
+    };
+
+    // Upload manifest
+    const manifestJson = JSON.stringify(manifest, null, 2);
+    const manifestBuffer = Buffer.from(manifestJson, 'utf8');
+    const manifestResult = await this.ipfs.add(manifestBuffer, {
+      pin: true,
+      cidVersion: 1,
+    });
+
+    manifest.manifestCid = manifestResult.cid.toString();
+    console.log(`[IPFS] Manifest uploaded: ${manifest.manifestCid}`);
+
+    // Store manifest CID in database (for retrieval)
+    await this.storeSnapshotReference(manifest);
+
+    console.log(`[IPFS] Snapshot published successfully`);
+    console.log(`[IPFS]   Snapshot CID: ${snapshotCid}`);
+    console.log(`[IPFS]   Manifest CID: ${manifest.manifestCid}`);
+    console.log(`[IPFS]   Proofs: ${manifest.totalProofs}, Batches: ${manifest.totalBatches}`);
+
+    return manifest;
+  }
+
+  /**
+   * Create snapshot data from database
+   */
+  private async createSnapshotData(): Promise<SnapshotData> {
+    // Get all proofs
+    const allProofs: ProofRecord[] = [];
+    // Note: We need to implement getAllProofs or iterate
+    // For now, we'll get proofs in batches
+    const totalProofs = await this.db.getTotalProofs();
+    const pendingProofs = await this.db.getPendingProofs(10000);
+    
+    // Get all batches
+    const batches = await this.db.getAllBatches();
+    
+    // Get latest batch
+    const latestBatch = await this.db.getLatestBatch();
+
+    // Collect all proofs (simplified - in production, would iterate through all)
+    // For now, we'll include pending proofs and proofs from batches
+    for (const proof of pendingProofs) {
+      allProofs.push(proof);
+    }
+
+    // Get proofs from batches
+    for (const batch of batches) {
+      const batchProofs = await this.db.getBatchProofs(batch.id);
+      for (const proof of batchProofs) {
+        // Avoid duplicates
+        if (!allProofs.find(p => p.hash === proof.hash)) {
+          allProofs.push(proof);
+        }
+      }
+    }
+
+    return {
+      proofs: allProofs,
+      batches: batches,
+      latestMerkleRoot: latestBatch?.root || null,
+      metadata: {
+        timestamp: new Date().toISOString(),
+        registryId: this.registryId,
+        totalProofs: allProofs.length,
+        totalBatches: batches.length,
+      },
+    };
+  }
+
+  /**
+   * Store snapshot reference in database
+   */
+  private async storeSnapshotReference(manifest: SnapshotManifest): Promise<void> {
+    // Store in audit log or create a snapshots table
+    // For now, we'll append to audit log
+    await this.db.appendAuditLog({
+      timestamp: manifest.timestamp,
+      action: 'audit_completed', // Using closest available action type
+      attestorDID: this.registryId,
+      details: `Snapshot published to IPFS: ${manifest.manifestCid}, Proofs: ${manifest.totalProofs}, Batches: ${manifest.totalBatches}`,
+    });
+  }
+
+  /**
+   * Retrieve snapshot from IPFS by CID
+   */
+  async retrieveSnapshot(cid: string): Promise<SnapshotData | null> {
+    if (!this.ipfs) {
+      throw new Error('IPFS client not available');
+    }
+
+    try {
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of this.ipfs.cat(cid)) {
+        chunks.push(chunk);
+      }
+
+      const data = Buffer.concat(chunks);
+      const snapshotData: SnapshotData = JSON.parse(data.toString('utf8'));
+
+      return snapshotData;
+    } catch (error) {
+      console.error(`[IPFS] Failed to retrieve snapshot ${cid}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Retrieve manifest from IPFS by CID
+   */
+  async retrieveManifest(cid: string): Promise<SnapshotManifest | null> {
+    if (!this.ipfs) {
+      throw new Error('IPFS client not available');
+    }
+
+    try {
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of this.ipfs.cat(cid)) {
+        chunks.push(chunk);
+      }
+
+      const data = Buffer.concat(chunks);
+      const manifest: SnapshotManifest = JSON.parse(data.toString('utf8'));
+
+      return manifest;
+    } catch (error) {
+      console.error(`[IPFS] Failed to retrieve manifest ${cid}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Verify snapshot integrity
+   */
+  async verifySnapshot(manifest: SnapshotManifest): Promise<boolean> {
+    try {
+      // Retrieve snapshot data
+      const snapshotData = await this.retrieveSnapshot(manifest.snapshotCid);
+      if (!snapshotData) {
+        return false;
+      }
+
+      // Verify counts match
+      if (snapshotData.metadata.totalProofs !== manifest.totalProofs) {
+        console.error('[IPFS] Proof count mismatch');
+        return false;
+      }
+
+      if (snapshotData.metadata.totalBatches !== manifest.totalBatches) {
+        console.error('[IPFS] Batch count mismatch');
+        return false;
+      }
+
+      // Verify Merkle root matches
+      if (snapshotData.latestMerkleRoot !== manifest.merkleRoot) {
+        console.error('[IPFS] Merkle root mismatch');
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('[IPFS] Snapshot verification failed:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get latest snapshot manifest CID
+   */
+  async getLatestSnapshotCid(): Promise<string | null> {
+    // Query audit logs for latest snapshot
+    const logs = await this.db.getAuditLogs(undefined, 100);
+    const snapshotLog = logs.find(log => 
+      log.action === 'audit_completed' && 
+      log.attestorDID === this.registryId &&
+      log.details?.includes('Snapshot published to IPFS')
+    );
+
+    if (snapshotLog && snapshotLog.details) {
+      // Extract CID from details (format: "Snapshot published to IPFS: QmXxx...")
+      const match = snapshotLog.details.match(/IPFS: ([A-Za-z0-9]+)/);
+      if (match) {
+        return match[1];
+      }
+    }
+
+    return null;
+  }
+}
+
+
+ * Publishes periodic state snapshots to IPFS per whitepaper Section 12.2
+ * "Each node maintains its own signed transparency log and publishes periodic state snapshots to IPFS"
+ */
+
+import { create } from 'ipfs-http-client';
+import { RegistryDatabase } from './database';
+import { ProofRecord, MerkleBatch } from './types';
+import { createHash } from 'crypto';
+
+export interface SnapshotManifest {
+  /** Snapshot version */
+  version: string;
+  /** Timestamp of snapshot */
+  timestamp: string;
+  /** Registry node identifier */
+  registryId: string;
+  /** Merkle root of all proofs */
+  merkleRoot: string;
+  /** Total number of proofs */
+  totalProofs: number;
+  /** Number of batches */
+  totalBatches: number;
+  /** Latest batch ID */
+  latestBatchId: string | null;
+  /** IPFS CID of the snapshot data */
+  snapshotCid: string;
+  /** IPFS CID of this manifest */
+  manifestCid: string;
+  /** Cryptographic signature of the snapshot */
+  signature?: string;
+}
+
+export interface SnapshotData {
+  /** All proofs in the registry */
+  proofs: ProofRecord[];
+  /** All Merkle batches */
+  batches: MerkleBatch[];
+  /** Latest Merkle root */
+  latestMerkleRoot: string | null;
+  /** Snapshot metadata */
+  metadata: {
+    timestamp: string;
+    registryId: string;
+    totalProofs: number;
+    totalBatches: number;
+  };
+}
+
+export class IPFSSnapshotService {
+  private ipfs: any;
+  private db: RegistryDatabase;
+  private registryId: string;
+  private snapshotInterval: number; // milliseconds
+  private intervalId: NodeJS.Timeout | null = null;
+
+  constructor(
+    db: RegistryDatabase,
+    registryId: string = 'pohw-registry-node',
+    ipfsGatewayUrl: string = 'https://ipfs.io',
+    snapshotInterval: number = 24 * 60 * 60 * 1000 // 24 hours
+  ) {
+    this.db = db;
+    this.registryId = registryId;
+    this.snapshotInterval = snapshotInterval;
+    this.ipfs = null; // Will be initialized lazily when needed
+
+    // Try to initialize IPFS client (non-blocking)
+    this.initializeIPFS(ipfsGatewayUrl);
+  }
+
+  private initializeIPFS(ipfsGatewayUrl: string): void {
+    try {
+      // Use public IPFS gateway or local node
+      const ipfsUrl = process.env.IPFS_URL || ipfsGatewayUrl;
+      
+      // Try to import and create IPFS client
+      // Use require for CJS compatibility
+      const ipfsClient = require('ipfs-http-client');
+      
+      this.ipfs = ipfsClient.create({
+        url: ipfsUrl.includes('://') ? ipfsUrl : `https://${ipfsUrl}`,
+      });
+      console.log(`[IPFS] Connected to IPFS gateway: ${ipfsUrl}`);
+    } catch (error: any) {
+      // If IPFS client is not available, that's okay
+      // The service will handle this gracefully
+      this.ipfs = null;
+      if (process.env.IPFS_ENABLED !== 'false') {
+        console.warn('[IPFS] Failed to initialize IPFS client:', error.message);
+        console.warn('[IPFS] Snapshots will be disabled (set IPFS_ENABLED=false to suppress this warning)');
+      }
+    }
+  }
+
+  /**
+   * Start periodic snapshot publishing
+   */
+  start(): void {
+    if (!this.ipfs) {
+      console.warn('[IPFS] Cannot start snapshots: IPFS not available');
+      return;
+    }
+
+    // Publish initial snapshot
+    this.publishSnapshot().catch(err => {
+      console.error('[IPFS] Initial snapshot failed:', err);
+    });
+
+    // Schedule periodic snapshots
+    this.intervalId = setInterval(() => {
+      this.publishSnapshot().catch(err => {
+        console.error('[IPFS] Periodic snapshot failed:', err);
+      });
+    }, this.snapshotInterval);
+
+    console.log(`[IPFS] Snapshot service started (interval: ${this.snapshotInterval / 1000 / 60} minutes)`);
+  }
+
+  /**
+   * Stop periodic snapshot publishing
+   */
+  stop(): void {
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+      console.log('[IPFS] Snapshot service stopped');
+    }
+  }
+
+  /**
+   * Create and publish a snapshot to IPFS
+   */
+  async publishSnapshot(): Promise<SnapshotManifest> {
+    if (!this.ipfs) {
+      throw new Error('IPFS client not available');
+    }
+
+    console.log('[IPFS] Creating snapshot...');
+
+    // Collect all data
+    const snapshotData = await this.createSnapshotData();
+
+    // Serialize snapshot
+    const snapshotJson = JSON.stringify(snapshotData, null, 2);
+    const snapshotBuffer = Buffer.from(snapshotJson, 'utf8');
+
+    // Upload to IPFS
+    const snapshotResult = await this.ipfs.add(snapshotBuffer, {
+      pin: true, // Pin the content
+      cidVersion: 1, // Use CIDv1 for better compatibility
+    });
+
+    const snapshotCid = snapshotResult.cid.toString();
+    console.log(`[IPFS] Snapshot uploaded: ${snapshotCid}`);
+
+    // Create manifest
+    const manifest: SnapshotManifest = {
+      version: '1.0.0',
+      timestamp: new Date().toISOString(),
+      registryId: this.registryId,
+      merkleRoot: snapshotData.latestMerkleRoot || '0x0',
+      totalProofs: snapshotData.metadata.totalProofs,
+      totalBatches: snapshotData.metadata.totalBatches,
+      latestBatchId: snapshotData.batches.length > 0 ? snapshotData.batches[snapshotData.batches.length - 1].id : null,
+      snapshotCid: snapshotCid,
+      manifestCid: '', // Will be set after manifest is uploaded
+    };
+
+    // Upload manifest
+    const manifestJson = JSON.stringify(manifest, null, 2);
+    const manifestBuffer = Buffer.from(manifestJson, 'utf8');
+    const manifestResult = await this.ipfs.add(manifestBuffer, {
+      pin: true,
+      cidVersion: 1,
+    });
+
+    manifest.manifestCid = manifestResult.cid.toString();
+    console.log(`[IPFS] Manifest uploaded: ${manifest.manifestCid}`);
+
+    // Store manifest CID in database (for retrieval)
+    await this.storeSnapshotReference(manifest);
+
+    console.log(`[IPFS] Snapshot published successfully`);
+    console.log(`[IPFS]   Snapshot CID: ${snapshotCid}`);
+    console.log(`[IPFS]   Manifest CID: ${manifest.manifestCid}`);
+    console.log(`[IPFS]   Proofs: ${manifest.totalProofs}, Batches: ${manifest.totalBatches}`);
+
+    return manifest;
+  }
+
+  /**
+   * Create snapshot data from database
+   */
+  private async createSnapshotData(): Promise<SnapshotData> {
+    // Get all proofs
+    const allProofs: ProofRecord[] = [];
+    // Note: We need to implement getAllProofs or iterate
+    // For now, we'll get proofs in batches
+    const totalProofs = await this.db.getTotalProofs();
+    const pendingProofs = await this.db.getPendingProofs(10000);
+    
+    // Get all batches
+    const batches = await this.db.getAllBatches();
+    
+    // Get latest batch
+    const latestBatch = await this.db.getLatestBatch();
+
+    // Collect all proofs (simplified - in production, would iterate through all)
+    // For now, we'll include pending proofs and proofs from batches
+    for (const proof of pendingProofs) {
+      allProofs.push(proof);
+    }
+
+    // Get proofs from batches
+    for (const batch of batches) {
+      const batchProofs = await this.db.getBatchProofs(batch.id);
+      for (const proof of batchProofs) {
+        // Avoid duplicates
+        if (!allProofs.find(p => p.hash === proof.hash)) {
+          allProofs.push(proof);
+        }
+      }
+    }
+
+    return {
+      proofs: allProofs,
+      batches: batches,
+      latestMerkleRoot: latestBatch?.root || null,
+      metadata: {
+        timestamp: new Date().toISOString(),
+        registryId: this.registryId,
+        totalProofs: allProofs.length,
+        totalBatches: batches.length,
+      },
+    };
+  }
+
+  /**
+   * Store snapshot reference in database
+   */
+  private async storeSnapshotReference(manifest: SnapshotManifest): Promise<void> {
+    // Store in audit log or create a snapshots table
+    // For now, we'll append to audit log
+    await this.db.appendAuditLog({
+      timestamp: manifest.timestamp,
+      action: 'audit_completed', // Using closest available action type
+      attestorDID: this.registryId,
+      details: `Snapshot published to IPFS: ${manifest.manifestCid}, Proofs: ${manifest.totalProofs}, Batches: ${manifest.totalBatches}`,
+    });
+  }
+
+  /**
+   * Retrieve snapshot from IPFS by CID
+   */
+  async retrieveSnapshot(cid: string): Promise<SnapshotData | null> {
+    if (!this.ipfs) {
+      throw new Error('IPFS client not available');
+    }
+
+    try {
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of this.ipfs.cat(cid)) {
+        chunks.push(chunk);
+      }
+
+      const data = Buffer.concat(chunks);
+      const snapshotData: SnapshotData = JSON.parse(data.toString('utf8'));
+
+      return snapshotData;
+    } catch (error) {
+      console.error(`[IPFS] Failed to retrieve snapshot ${cid}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Retrieve manifest from IPFS by CID
+   */
+  async retrieveManifest(cid: string): Promise<SnapshotManifest | null> {
+    if (!this.ipfs) {
+      throw new Error('IPFS client not available');
+    }
+
+    try {
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of this.ipfs.cat(cid)) {
+        chunks.push(chunk);
+      }
+
+      const data = Buffer.concat(chunks);
+      const manifest: SnapshotManifest = JSON.parse(data.toString('utf8'));
+
+      return manifest;
+    } catch (error) {
+      console.error(`[IPFS] Failed to retrieve manifest ${cid}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Verify snapshot integrity
+   */
+  async verifySnapshot(manifest: SnapshotManifest): Promise<boolean> {
+    try {
+      // Retrieve snapshot data
+      const snapshotData = await this.retrieveSnapshot(manifest.snapshotCid);
+      if (!snapshotData) {
+        return false;
+      }
+
+      // Verify counts match
+      if (snapshotData.metadata.totalProofs !== manifest.totalProofs) {
+        console.error('[IPFS] Proof count mismatch');
+        return false;
+      }
+
+      if (snapshotData.metadata.totalBatches !== manifest.totalBatches) {
+        console.error('[IPFS] Batch count mismatch');
+        return false;
+      }
+
+      // Verify Merkle root matches
+      if (snapshotData.latestMerkleRoot !== manifest.merkleRoot) {
+        console.error('[IPFS] Merkle root mismatch');
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('[IPFS] Snapshot verification failed:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get latest snapshot manifest CID
+   */
+  async getLatestSnapshotCid(): Promise<string | null> {
+    // Query audit logs for latest snapshot
+    const logs = await this.db.getAuditLogs(undefined, 100);
+    const snapshotLog = logs.find(log => 
+      log.action === 'audit_completed' && 
+      log.attestorDID === this.registryId &&
+      log.details?.includes('Snapshot published to IPFS')
+    );
+
+    if (snapshotLog && snapshotLog.details) {
+      // Extract CID from details (format: "Snapshot published to IPFS: QmXxx...")
+      const match = snapshotLog.details.match(/IPFS: ([A-Za-z0-9]+)/);
+      if (match) {
+        return match[1];
+      }
+    }
+
+    return null;
+  }
+}
+

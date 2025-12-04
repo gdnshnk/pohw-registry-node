@@ -33,7 +33,7 @@ export class BatchManager {
    * Create a new batch from pending proofs
    */
   async createBatch(): Promise<MerkleBatch | null> {
-    const pending = this.db.getPendingProofs(this.config.batchSize);
+    const pending = await this.db.getPendingProofs(this.config.batchSize);
 
     if (pending.length === 0) {
       return null;
@@ -49,9 +49,10 @@ export class BatchManager {
     const root = calculateMerkleRoot(hashes);
 
     // Update proofs with batch info
-    pending.forEach((proof, index) => {
-      this.db.updateProofBatch(proof.hash, batchId, index);
-    });
+    for (const proof of pending) {
+      const index = pending.indexOf(proof);
+      await this.db.updateProofBatch(proof.hash, batchId, index);
+    }
 
     // Store batch
     const batch: Omit<MerkleBatch, 'created_at'> = {
@@ -60,7 +61,7 @@ export class BatchManager {
       size: pending.length
     };
 
-    this.db.storeMerkleBatch(batch);
+    await this.db.storeMerkleBatch(batch);
 
     // Anchor to blockchains if configured
     if (this.anchorConfig?.enabled) {
@@ -101,22 +102,22 @@ export class BatchManager {
   /**
    * Get Merkle proof for a hash
    */
-  getMerkleProof(hash: string): {
+  async getMerkleProof(hash: string): Promise<{
     proof: string[];
     root: string;
     batchId: string;
-  } | null {
-    const proofRecord = this.db.getProofByHash(hash);
+  } | null> {
+    const proofRecord = await this.db.getProofByHash(hash);
 
     if (!proofRecord || !proofRecord.batch_id) {
       return null;
     }
 
-    const batchProofs = this.db.getBatchProofs(proofRecord.batch_id);
+    const batchProofs = await this.db.getBatchProofs(proofRecord.batch_id);
     const hashes = batchProofs.map(p => p.hash);
     const proof = generateMerkleProof(hashes, hash);
 
-    const batch = this.db.getLatestBatch();
+    const batch = await this.db.getBatchById(proofRecord.batch_id);
     if (!batch || batch.id !== proofRecord.batch_id) {
       return null;
     }
@@ -141,9 +142,18 @@ export class BatchManager {
   /**
    * Check if batch should be created
    */
-  shouldCreateBatch(): boolean {
-    const pendingCount = this.db.getPendingCount();
+  async shouldCreateBatch(): Promise<boolean> {
+    const pendingCount = await this.db.getPendingCount();
     return pendingCount >= this.config.batchSize;
   }
 }
+
+
+
+
+
+
+
+
+
 

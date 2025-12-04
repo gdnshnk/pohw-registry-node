@@ -5,9 +5,10 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
-import { ProofRecord, MerkleBatch } from './types';
+import { ProofRecord, MerkleBatch, ChallengeRecord } from './types';
 import { DIDDocument, KCGNode } from './did';
 import { AttestorRecord, VerifiableHumanCredential, RevocationRecord, AuditLogEntry } from './attestors';
+import { createHash } from 'crypto';
 
 export class SimpleDatabase {
   private dataDir: string;
@@ -22,6 +23,8 @@ export class SimpleDatabase {
   private reputationFile: string;
   private submissionHistoryFile: string;
   private anomalyLogFile: string;
+  private challengesFile: string;
+  private transparencyLogFile: string;
 
   constructor(dataDir: string = './data') {
     this.dataDir = dataDir;
@@ -36,6 +39,8 @@ export class SimpleDatabase {
     this.reputationFile = join(dataDir, 'reputation.json');
     this.submissionHistoryFile = join(dataDir, 'submission-history.json');
     this.anomalyLogFile = join(dataDir, 'anomaly-log.json');
+    this.challengesFile = join(dataDir, 'challenges.json');
+    this.transparencyLogFile = join(dataDir, 'transparency-log.json');
 
     // Ensure data directory exists
     if (!existsSync(dataDir)) {
@@ -75,6 +80,12 @@ export class SimpleDatabase {
     }
     if (!existsSync(this.anomalyLogFile)) {
       writeFileSync(this.anomalyLogFile, JSON.stringify({}, null, 2));
+    }
+    if (!existsSync(this.challengesFile)) {
+      writeFileSync(this.challengesFile, JSON.stringify([], null, 2));
+    }
+    if (!existsSync(this.transparencyLogFile)) {
+      writeFileSync(this.transparencyLogFile, JSON.stringify([], null, 2));
     }
   }
 
@@ -184,6 +195,10 @@ export class SimpleDatabase {
   getBatchById(batchId: string): MerkleBatch | null {
     const batches = this.readBatches();
     return batches.find(b => b.id === batchId) || null;
+  }
+
+  getAllBatches(): MerkleBatch[] {
+    return this.readBatches();
   }
 
   getTotalProofs(): number {
@@ -473,6 +488,551 @@ export class SimpleDatabase {
   getAnomalyLog(did: string): string[] {
     const all = this.readAnomalyLog();
     return all[did] || [];
+  }
+
+  // Challenge storage (dispute resolution)
+  private readChallenges(): ChallengeRecord[] {
+    if (!existsSync(this.challengesFile)) {
+      return [];
+    }
+    const data = readFileSync(this.challengesFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeChallenges(challenges: ChallengeRecord[]) {
+    writeFileSync(this.challengesFile, JSON.stringify(challenges, null, 2));
+  }
+
+  storeChallenge(challenge: Omit<ChallengeRecord, 'id'>): string {
+    const challenges = this.readChallenges();
+    // Generate challenge ID from hash of proof_hash + challenger_did + timestamp
+    const challengeData = `${challenge.proof_hash}-${challenge.challenger_did}-${challenge.created_at}`;
+    const challengeId = '0x' + createHash('sha256').update(challengeData).digest('hex').substring(0, 16);
+    
+    const newChallenge: ChallengeRecord = {
+      id: challengeId,
+      ...challenge
+    };
+    
+    challenges.push(newChallenge);
+    this.writeChallenges(challenges);
+    return challengeId;
+  }
+
+  getChallengeById(challengeId: string): ChallengeRecord | null {
+    const challenges = this.readChallenges();
+    return challenges.find(c => c.id === challengeId) || null;
+  }
+
+  getChallengesByProofHash(proofHash: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_hash === proofHash);
+  }
+
+  getChallengesByDID(did: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_did === did || c.challenger_did === did);
+  }
+
+  updateChallenge(challengeId: string, updates: Partial<ChallengeRecord>): void {
+    const challenges = this.readChallenges();
+    const index = challenges.findIndex(c => c.id === challengeId);
+    if (index !== -1) {
+      challenges[index] = { ...challenges[index], ...updates };
+      this.writeChallenges(challenges);
+    }
+  }
+
+  // Transparency log (for dispute outcomes)
+  private readTransparencyLog(): any[] {
+    if (!existsSync(this.transparencyLogFile)) {
+      return [];
+    }
+    const data = readFileSync(this.transparencyLogFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeTransparencyLog(entries: any[]) {
+    writeFileSync(this.transparencyLogFile, JSON.stringify(entries, null, 2));
+  }
+
+  appendTransparencyLog(entry: {
+    type: 'challenge_submitted' | 'challenge_responded' | 'challenge_resolved';
+    challenge_id: string;
+    proof_hash: string;
+    did?: string;
+    resolution?: string;
+    timestamp: string;
+    details?: any;
+  }): void {
+    const log = this.readTransparencyLog();
+    log.push(entry);
+    // Keep only last 10000 entries
+    if (log.length > 10000) {
+      log.shift();
+    }
+    this.writeTransparencyLog(log);
+  }
+
+  getTransparencyLog(limit: number = 100): any[] {
+    const log = this.readTransparencyLog();
+    return log.slice(-limit).reverse(); // Most recent first
+  }
+
+  close() {
+    // No-op for file-based storage
+  }
+}
+
+  appendAnomalyLog(did: string, entry: string): void {
+    const all = this.readAnomalyLog();
+    if (!all[did]) {
+      all[did] = [];
+    }
+    all[did].push(entry);
+    
+    // Keep only last 100 entries per DID
+    if (all[did].length > 100) {
+      all[did] = all[did].slice(-100);
+    }
+    
+    this.writeAnomalyLog(all);
+  }
+
+  getAnomalyLog(did: string): string[] {
+    const all = this.readAnomalyLog();
+    return all[did] || [];
+  }
+
+  // Challenge storage (dispute resolution)
+  private readChallenges(): ChallengeRecord[] {
+    if (!existsSync(this.challengesFile)) {
+      return [];
+    }
+    const data = readFileSync(this.challengesFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeChallenges(challenges: ChallengeRecord[]) {
+    writeFileSync(this.challengesFile, JSON.stringify(challenges, null, 2));
+  }
+
+  storeChallenge(challenge: Omit<ChallengeRecord, 'id'>): string {
+    const challenges = this.readChallenges();
+    // Generate challenge ID from hash of proof_hash + challenger_did + timestamp
+    const challengeData = `${challenge.proof_hash}-${challenge.challenger_did}-${challenge.created_at}`;
+    const challengeId = '0x' + createHash('sha256').update(challengeData).digest('hex').substring(0, 16);
+    
+    const newChallenge: ChallengeRecord = {
+      id: challengeId,
+      ...challenge
+    };
+    
+    challenges.push(newChallenge);
+    this.writeChallenges(challenges);
+    return challengeId;
+  }
+
+  getChallengeById(challengeId: string): ChallengeRecord | null {
+    const challenges = this.readChallenges();
+    return challenges.find(c => c.id === challengeId) || null;
+  }
+
+  getChallengesByProofHash(proofHash: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_hash === proofHash);
+  }
+
+  getChallengesByDID(did: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_did === did || c.challenger_did === did);
+  }
+
+  updateChallenge(challengeId: string, updates: Partial<ChallengeRecord>): void {
+    const challenges = this.readChallenges();
+    const index = challenges.findIndex(c => c.id === challengeId);
+    if (index !== -1) {
+      challenges[index] = { ...challenges[index], ...updates };
+      this.writeChallenges(challenges);
+    }
+  }
+
+  // Transparency log (for dispute outcomes)
+  private readTransparencyLog(): any[] {
+    if (!existsSync(this.transparencyLogFile)) {
+      return [];
+    }
+    const data = readFileSync(this.transparencyLogFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeTransparencyLog(entries: any[]) {
+    writeFileSync(this.transparencyLogFile, JSON.stringify(entries, null, 2));
+  }
+
+  appendTransparencyLog(entry: {
+    type: 'challenge_submitted' | 'challenge_responded' | 'challenge_resolved';
+    challenge_id: string;
+    proof_hash: string;
+    did?: string;
+    resolution?: string;
+    timestamp: string;
+    details?: any;
+  }): void {
+    const log = this.readTransparencyLog();
+    log.push(entry);
+    // Keep only last 10000 entries
+    if (log.length > 10000) {
+      log.shift();
+    }
+    this.writeTransparencyLog(log);
+  }
+
+  getTransparencyLog(limit: number = 100): any[] {
+    const log = this.readTransparencyLog();
+    return log.slice(-limit).reverse(); // Most recent first
+  }
+
+  close() {
+    // No-op for file-based storage
+  }
+}
+
+  appendAnomalyLog(did: string, entry: string): void {
+    const all = this.readAnomalyLog();
+    if (!all[did]) {
+      all[did] = [];
+    }
+    all[did].push(entry);
+    
+    // Keep only last 100 entries per DID
+    if (all[did].length > 100) {
+      all[did] = all[did].slice(-100);
+    }
+    
+    this.writeAnomalyLog(all);
+  }
+
+  getAnomalyLog(did: string): string[] {
+    const all = this.readAnomalyLog();
+    return all[did] || [];
+  }
+
+  // Challenge storage (dispute resolution)
+  private readChallenges(): ChallengeRecord[] {
+    if (!existsSync(this.challengesFile)) {
+      return [];
+    }
+    const data = readFileSync(this.challengesFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeChallenges(challenges: ChallengeRecord[]) {
+    writeFileSync(this.challengesFile, JSON.stringify(challenges, null, 2));
+  }
+
+  storeChallenge(challenge: Omit<ChallengeRecord, 'id'>): string {
+    const challenges = this.readChallenges();
+    // Generate challenge ID from hash of proof_hash + challenger_did + timestamp
+    const challengeData = `${challenge.proof_hash}-${challenge.challenger_did}-${challenge.created_at}`;
+    const challengeId = '0x' + createHash('sha256').update(challengeData).digest('hex').substring(0, 16);
+    
+    const newChallenge: ChallengeRecord = {
+      id: challengeId,
+      ...challenge
+    };
+    
+    challenges.push(newChallenge);
+    this.writeChallenges(challenges);
+    return challengeId;
+  }
+
+  getChallengeById(challengeId: string): ChallengeRecord | null {
+    const challenges = this.readChallenges();
+    return challenges.find(c => c.id === challengeId) || null;
+  }
+
+  getChallengesByProofHash(proofHash: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_hash === proofHash);
+  }
+
+  getChallengesByDID(did: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_did === did || c.challenger_did === did);
+  }
+
+  updateChallenge(challengeId: string, updates: Partial<ChallengeRecord>): void {
+    const challenges = this.readChallenges();
+    const index = challenges.findIndex(c => c.id === challengeId);
+    if (index !== -1) {
+      challenges[index] = { ...challenges[index], ...updates };
+      this.writeChallenges(challenges);
+    }
+  }
+
+  // Transparency log (for dispute outcomes)
+  private readTransparencyLog(): any[] {
+    if (!existsSync(this.transparencyLogFile)) {
+      return [];
+    }
+    const data = readFileSync(this.transparencyLogFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeTransparencyLog(entries: any[]) {
+    writeFileSync(this.transparencyLogFile, JSON.stringify(entries, null, 2));
+  }
+
+  appendTransparencyLog(entry: {
+    type: 'challenge_submitted' | 'challenge_responded' | 'challenge_resolved';
+    challenge_id: string;
+    proof_hash: string;
+    did?: string;
+    resolution?: string;
+    timestamp: string;
+    details?: any;
+  }): void {
+    const log = this.readTransparencyLog();
+    log.push(entry);
+    // Keep only last 10000 entries
+    if (log.length > 10000) {
+      log.shift();
+    }
+    this.writeTransparencyLog(log);
+  }
+
+  getTransparencyLog(limit: number = 100): any[] {
+    const log = this.readTransparencyLog();
+    return log.slice(-limit).reverse(); // Most recent first
+  }
+
+  close() {
+    // No-op for file-based storage
+  }
+}
+
+  appendAnomalyLog(did: string, entry: string): void {
+    const all = this.readAnomalyLog();
+    if (!all[did]) {
+      all[did] = [];
+    }
+    all[did].push(entry);
+    
+    // Keep only last 100 entries per DID
+    if (all[did].length > 100) {
+      all[did] = all[did].slice(-100);
+    }
+    
+    this.writeAnomalyLog(all);
+  }
+
+  getAnomalyLog(did: string): string[] {
+    const all = this.readAnomalyLog();
+    return all[did] || [];
+  }
+
+  // Challenge storage (dispute resolution)
+  private readChallenges(): ChallengeRecord[] {
+    if (!existsSync(this.challengesFile)) {
+      return [];
+    }
+    const data = readFileSync(this.challengesFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeChallenges(challenges: ChallengeRecord[]) {
+    writeFileSync(this.challengesFile, JSON.stringify(challenges, null, 2));
+  }
+
+  storeChallenge(challenge: Omit<ChallengeRecord, 'id'>): string {
+    const challenges = this.readChallenges();
+    // Generate challenge ID from hash of proof_hash + challenger_did + timestamp
+    const challengeData = `${challenge.proof_hash}-${challenge.challenger_did}-${challenge.created_at}`;
+    const challengeId = '0x' + createHash('sha256').update(challengeData).digest('hex').substring(0, 16);
+    
+    const newChallenge: ChallengeRecord = {
+      id: challengeId,
+      ...challenge
+    };
+    
+    challenges.push(newChallenge);
+    this.writeChallenges(challenges);
+    return challengeId;
+  }
+
+  getChallengeById(challengeId: string): ChallengeRecord | null {
+    const challenges = this.readChallenges();
+    return challenges.find(c => c.id === challengeId) || null;
+  }
+
+  getChallengesByProofHash(proofHash: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_hash === proofHash);
+  }
+
+  getChallengesByDID(did: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_did === did || c.challenger_did === did);
+  }
+
+  updateChallenge(challengeId: string, updates: Partial<ChallengeRecord>): void {
+    const challenges = this.readChallenges();
+    const index = challenges.findIndex(c => c.id === challengeId);
+    if (index !== -1) {
+      challenges[index] = { ...challenges[index], ...updates };
+      this.writeChallenges(challenges);
+    }
+  }
+
+  // Transparency log (for dispute outcomes)
+  private readTransparencyLog(): any[] {
+    if (!existsSync(this.transparencyLogFile)) {
+      return [];
+    }
+    const data = readFileSync(this.transparencyLogFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeTransparencyLog(entries: any[]) {
+    writeFileSync(this.transparencyLogFile, JSON.stringify(entries, null, 2));
+  }
+
+  appendTransparencyLog(entry: {
+    type: 'challenge_submitted' | 'challenge_responded' | 'challenge_resolved';
+    challenge_id: string;
+    proof_hash: string;
+    did?: string;
+    resolution?: string;
+    timestamp: string;
+    details?: any;
+  }): void {
+    const log = this.readTransparencyLog();
+    log.push(entry);
+    // Keep only last 10000 entries
+    if (log.length > 10000) {
+      log.shift();
+    }
+    this.writeTransparencyLog(log);
+  }
+
+  getTransparencyLog(limit: number = 100): any[] {
+    const log = this.readTransparencyLog();
+    return log.slice(-limit).reverse(); // Most recent first
+  }
+
+  close() {
+    // No-op for file-based storage
+  }
+}
+
+  appendAnomalyLog(did: string, entry: string): void {
+    const all = this.readAnomalyLog();
+    if (!all[did]) {
+      all[did] = [];
+    }
+    all[did].push(entry);
+    
+    // Keep only last 100 entries per DID
+    if (all[did].length > 100) {
+      all[did] = all[did].slice(-100);
+    }
+    
+    this.writeAnomalyLog(all);
+  }
+
+  getAnomalyLog(did: string): string[] {
+    const all = this.readAnomalyLog();
+    return all[did] || [];
+  }
+
+  // Challenge storage (dispute resolution)
+  private readChallenges(): ChallengeRecord[] {
+    if (!existsSync(this.challengesFile)) {
+      return [];
+    }
+    const data = readFileSync(this.challengesFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeChallenges(challenges: ChallengeRecord[]) {
+    writeFileSync(this.challengesFile, JSON.stringify(challenges, null, 2));
+  }
+
+  storeChallenge(challenge: Omit<ChallengeRecord, 'id'>): string {
+    const challenges = this.readChallenges();
+    // Generate challenge ID from hash of proof_hash + challenger_did + timestamp
+    const challengeData = `${challenge.proof_hash}-${challenge.challenger_did}-${challenge.created_at}`;
+    const challengeId = '0x' + createHash('sha256').update(challengeData).digest('hex').substring(0, 16);
+    
+    const newChallenge: ChallengeRecord = {
+      id: challengeId,
+      ...challenge
+    };
+    
+    challenges.push(newChallenge);
+    this.writeChallenges(challenges);
+    return challengeId;
+  }
+
+  getChallengeById(challengeId: string): ChallengeRecord | null {
+    const challenges = this.readChallenges();
+    return challenges.find(c => c.id === challengeId) || null;
+  }
+
+  getChallengesByProofHash(proofHash: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_hash === proofHash);
+  }
+
+  getChallengesByDID(did: string): ChallengeRecord[] {
+    const challenges = this.readChallenges();
+    return challenges.filter(c => c.proof_did === did || c.challenger_did === did);
+  }
+
+  updateChallenge(challengeId: string, updates: Partial<ChallengeRecord>): void {
+    const challenges = this.readChallenges();
+    const index = challenges.findIndex(c => c.id === challengeId);
+    if (index !== -1) {
+      challenges[index] = { ...challenges[index], ...updates };
+      this.writeChallenges(challenges);
+    }
+  }
+
+  // Transparency log (for dispute outcomes)
+  private readTransparencyLog(): any[] {
+    if (!existsSync(this.transparencyLogFile)) {
+      return [];
+    }
+    const data = readFileSync(this.transparencyLogFile, 'utf8');
+    return JSON.parse(data);
+  }
+
+  private writeTransparencyLog(entries: any[]) {
+    writeFileSync(this.transparencyLogFile, JSON.stringify(entries, null, 2));
+  }
+
+  appendTransparencyLog(entry: {
+    type: 'challenge_submitted' | 'challenge_responded' | 'challenge_resolved';
+    challenge_id: string;
+    proof_hash: string;
+    did?: string;
+    resolution?: string;
+    timestamp: string;
+    details?: any;
+  }): void {
+    const log = this.readTransparencyLog();
+    log.push(entry);
+    // Keep only last 10000 entries
+    if (log.length > 10000) {
+      log.shift();
+    }
+    this.writeTransparencyLog(log);
+  }
+
+  getTransparencyLog(limit: number = 100): any[] {
+    const log = this.readTransparencyLog();
+    return log.slice(-limit).reverse(); // Most recent first
   }
 
   close() {
